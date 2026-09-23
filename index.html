@@ -762,39 +762,61 @@ function drawAlertBars(){
 function renderBlocks(){
   var bs=D.blockStats; if(!bs) return;
   document.getElementById("blkRange").textContent=bs.first+" → "+bs.last+" · "+bs.n+" хэлцэл";
-  var cards=[["Нийт дүн",(bs.value/1e9).toFixed(1),"тэрбум ₮"],["Давтамж",bs.perDay.toFixed(2),"хэлцэл/өдөр"],
-    ["Медиан хэлцэл",money(bs.med),"₮"],["Медиан premium",pct(bs.premMed,1),""]];
+
+  var cards=[
+    ["Нийт дүн",(bs.value/1e9).toFixed(1),"тэрбум ₮"],
+    ["Давтамж",bs.perDay.toFixed(2),"хэлцэл/өдөр"],
+    ["Медиан хэлцэл",money(bs.med),"₮"],
+    ["Медиан premium",pct(bs.premMed,1),""]
+  ];
   document.getElementById("blkStats").innerHTML=cards.map(function(c){
     return '<div class="bstat"><div class="eyebrow">'+esc(c[0])+'</div><div class="v">'+esc(c[1])+
-      (c[2]?'<span style="font-size:11px;color:var(--ink-3);font-weight:400;margin-left:4px">'+esc(c[2])+'</span>':'')+'</div></div>';}).join("");
+      (c[2]?'<span style="font-size:11px;color:var(--ink-3);font-weight:400;margin-left:4px">'+esc(c[2])+'</span>':'')+
+      '</div></div>';
+  }).join("");
+
   var maxV=Math.max.apply(null,(D.blockTop||[]).map(function(t){return t.val;}))||1;
   document.getElementById("blkTop").innerHTML=(D.blockTop||[]).slice(0,7).map(function(t){
-    var pr=t.prem==null?'—':pct(t.prem,1), col=t.prem==null?'var(--ink-3)':(t.prem>=0?'var(--up)':'var(--down)');
+    var pr=t.prem==null?'—':pct(t.prem,1);
+    var col=t.prem==null?'var(--ink-3)':(t.prem>=0?'var(--up)':'var(--down)');
     return '<div class="blkrow"><span class="sym">'+esc(t.sym)+'</span>'+
       '<span class="bar" style="width:100%"><span style="width:'+(t.val/maxV*100).toFixed(1)+'%"></span></span>'+
-      '<span class="num" style="font-size:11.5px">'+(t.val/1e9).toFixed(1)+' тэрбум <span style="color:'+col+'">'+pr+'</span></span></div>';}).join("");
-  var sel=(D.blocks[SEL]||[]).map(function(b){return {date:SEL,sym:b[0],name:b[1],price:b[2],qty:b[3],value:b[4],prem:b[5],ref:b[6]};});
-  var list=sel, title;
-  if(sel.length){ title=SEL+" — "+sel.length+" хэлцэл"; }
-  else{
-    title="Энэ өдөр багцын арилжаа болоогүй · сүүлийн 20 хэлцлийг харуулав";
-    list=[]; var ds=Object.keys(D.blocks).sort().reverse();
-    for(var i=0;i<ds.length && list.length<20;i++){
-      if(ds[i]>SEL) continue;
-      D.blocks[ds[i]].forEach(function(b){ if(list.length<20) list.push({date:ds[i],sym:b[0],name:b[1],price:b[2],qty:b[3],value:b[4],prem:b[5],ref:b[6]}); });
-    }
-  }
-  document.getElementById("blkTitle").textContent=title;
+      '<span class="num" style="font-size:11.5px">'+(t.val/1e9).toFixed(1)+' тэрбум <span style="color:'+col+'">'+pr+'</span></span></div>';
+  }).join("");
+
+  /* БҮХ түүхэн багцын арилжааг шинэ -> хуучин дарааллаар харуулна.
+     Сонгосон өдрийн мөр байвал зөвхөн ялгаж тэмдэглэнэ; жагсаалтыг хязгаарлахгүй. */
+  var list=[];
+  Object.keys(D.blocks||{}).sort().reverse().forEach(function(d){
+    (D.blocks[d]||[]).forEach(function(b){
+      list.push({
+        date:d,sym:b[0],name:b[1],price:b[2],qty:b[3],
+        value:b[4],prem:b[5],ref:b[6]
+      });
+    });
+  });
+
+  document.getElementById("blkTitle").textContent=
+    "Түүхэн багцын арилжаа · шинэ → хуучин · "+list.length+" хэлцэл";
+
   var hint=document.getElementById("blkHint");
-  if(hint) hint.textContent = sel.length ? (SEL+" — "+sel.length+" хэлцэл · нээх") : "Энэ өдөр байхгүй · түүхийг нээх";
-  document.getElementById("blkBody").innerHTML=list.map(function(r){
+  if(hint) hint.textContent=list.length+" хэлцэл · түүхийг нээх";
+
+  document.getElementById("blkBody").innerHTML=list.length ? list.map(function(r){
     var col=r.prem==null?'var(--ink-3)':(r.prem>=0?'var(--up)':'var(--down)');
     var mark=r.prem==null?'':(r.prem>=0?'▲ ':'▼ ');
-    return '<tr><td class="num muted">'+esc(r.date)+'</td><td class="sym">'+esc(r.sym)+'</td>'+
-      '<td class="cname" style="max-width:180px">'+esc(r.name)+'</td><td class="num">'+fmt(r.price,2)+'</td>'+
+    var selStyle=r.date===SEL?' style="background:rgba(255,159,67,.06)"':'';
+    return '<tr'+selStyle+'><td class="num muted">'+esc(r.date)+'</td>'+
+      '<td class="sym">'+esc(r.sym)+'</td>'+
+      '<td class="cname" style="max-width:180px">'+esc(r.name)+'</td>'+
+      '<td class="num">'+fmt(r.price,2)+'</td>'+
       '<td class="num muted">'+(r.ref==null?'—':fmt(r.ref,2))+'</td>'+
       '<td class="prem" style="color:'+col+'">'+mark+(r.prem==null?'—':pct(r.prem,1))+'</td>'+
-      '<td class="num muted">'+fmt(r.qty)+'</td><td class="num">'+money(r.value)+' ₮</td></tr>';}).join("");
+      '<td class="num muted">'+fmt(r.qty)+'</td>'+
+      '<td class="num">'+money(r.value)+' ₮</td></tr>';
+  }).join("") :
+    '<tr><td colspan="8" class="muted" style="padding:20px;text-align:center">Багцын арилжааны түүхэн дата алга.</td></tr>';
+
   drawBlockMonths();
 }
 function drawBlockMonths(){
