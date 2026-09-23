@@ -27,3 +27,5 @@ with sync_playwright() as p:
         if any(k in u for k in ["report","trade","history","daily","date","market"]):
             print("[REQ]",json.dumps(x,ensure_ascii=False))
     browser.close()
+
+# trigger debug workflow
