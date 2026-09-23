@@ -2,7 +2,7 @@
 from playwright.sync_api import sync_playwright
 import json
 
-TARGET="2026-09-22"
+TARGET="2026-09-23"
 with sync_playwright() as p:
     browser=p.chromium.launch(headless=True,args=["--disable-blink-features=AutomationControlled"])
     page=browser.new_page(
@@ -12,17 +12,17 @@ with sync_playwright() as p:
     def on_resp(resp):
         try:
             post=resp.request.post_data or ""
-            if "tradingHistoryCs" in post and TARGET in post:
-                body=resp.text()
-                captured.append({"post":post,"status":resp.status,"ct":resp.headers.get("content-type"),"body":body[:12000]})
+            if ("tradingBlock" in post) and TARGET in post:
+                captured.append({"post":post,"status":resp.status,"ct":resp.headers.get("content-type"),"body":resp.text()[:16000]})
         except Exception as e:
             captured.append({"error":str(e)})
     page.on("response",on_resp)
     page.goto("https://new.mse.mn/trade-daily-report",wait_until="domcontentloaded",timeout=90000)
     page.wait_for_timeout(7000)
     inp=page.locator('input[type="date"]')
-    inp.evaluate("""(e,v)=>{const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));}""",TARGET)
-    page.wait_for_timeout(20000)
+    if inp.input_value()!=TARGET:
+        inp.evaluate("""(e,v)=>{const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));}""",TARGET)
+    page.wait_for_timeout(15000)
     for x in captured:
-        print("[RESP]",json.dumps(x,ensure_ascii=False))
+        print("[BLOCKRESP]",json.dumps(x,ensure_ascii=False))
     browser.close()
