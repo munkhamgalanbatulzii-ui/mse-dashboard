@@ -546,7 +546,7 @@ function render(){
   var dnote=document.getElementById("dataNote");
   if(dnote&&D.dataNote) dnote.textContent=D.dataNote;
   var dn=document.getElementById("dvNote");
-  if(dn&&D.divMeta) dn.textContent="Ногдол ашиг: "+D.divMeta.source+" — зөвхөн 2026 онд зарлагдсан ("+D.divMeta.n+" зарлал). Өгөөж = НА ÷ сүүлийн хаалт.";
+  if(dn&&D.divMeta) dn.textContent="Ногдол ашиг: "+D.divMeta.source+" — "+D.divMeta.n+" зарлал"+(D.divMeta.lastChecked?" · сүүлд шалгасан "+D.divMeta.lastChecked:"")+". Өгөөж = НА ÷ сүүлийн хаалт.";
   var mn=document.getElementById("mcapNote");
   if(mn&&D.mcapMeta) mn.textContent="Зах зээлийн үнэлгээ: "+D.mcapMeta.source+" ("+D.mcapMeta.date+"). Бусад "+(D.stats.symbols-D.mcapMeta.n)+" симболын үнэлгээ нийтлэгдээгүй.";
   document.getElementById("fstats").textContent = D.stats.rows.toLocaleString("en-US")+" мөр · "+D.stats.symbols+" симбол · нийт "+D.stats.alertsTotal.toLocaleString("en-US")+" дохио (4.59/өдөр)";
@@ -863,7 +863,7 @@ function renderDiv(){
   var rng=anns.length?(anns[0]+" → "+anns[anns.length-1]):(m.range||"");
   document.getElementById("dvMeta").textContent=(DVPER==="all"?rng:DVPER)+" · "+Object.keys(comp).length+" компани";
   document.getElementById("dvShown").textContent=rows.length+" зарлал"+(DVPER==="all"?"":" / нийт "+all.length);
-  document.getElementById("dvHint").textContent=rows.length+" зарлал · нээх";
+  document.getElementById("dvHint").textContent=rows.length+" зарлал"+(m.lastChecked?" · шалгасан "+m.lastChecked:"")+" · нээх";
   if(!rows.length){ document.getElementById("dvBody").innerHTML='<tr><td colspan="9" class="muted" style="padding:20px;text-align:center">'+(DVQ?"Хайлтад тохирох зарлал алга.":"Энэ хамрах үед зарлал алга.")+'</td></tr>'; document.getElementById("dvStats").innerHTML=""; return; }
   document.getElementById("dvStats").innerHTML=[
     ["Зарлал",rows.length,""],["Компани",Object.keys(comp).length,""],
