@@ -699,97 +699,119 @@ def _parse_dividend_article(data, ann, href, card_title, article_text):
     }
 
 def update_dividend_news(data):
-    """Check MSE recent news for new dividend announcements and append them."""
+    """Check MSE public news API for new dividend announcements and append them."""
     today = datetime.now(TZ).date().isoformat()
     current = data.setdefault("div", [])
-    latest_ann = max((r.get("ann","") for r in current), default="")
     existing = {
         (r.get("ann"), r.get("sym"), None if r.get("dps") is None else round(float(r.get("dps")), 6))
         for r in current
     }
     existing_urls = {r.get("url") for r in current if r.get("url")}
+    latest_ann = max((r.get("ann","") for r in current), default="")
     added = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
+        request = p.request.new_context(
+            extra_http_headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/153.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://new.mse.mn/live-market",
+            }
         )
-        context = _desktop_context(browser)
-        page = context.new_page()
-        resp = page.goto(
-            "https://new.mse.mn/investor-hub",
-            wait_until="domcontentloaded",
+        rr = request.get(
+            "https://new.mse.mn/api/public/news?limit=100&lang=mn",
             timeout=90000,
         )
-        if resp and resp.status >= 400:
-            browser.close()
-            raise RuntimeError(f"MSE investor hub returned HTTP {resp.status}")
-        try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except PlaywrightTimeoutError:
-            pass
-        page.wait_for_timeout(6000)
-
-        cards = page.eval_on_selector_all(
-            'a[href*="/news/"]',
-            """els => els.map(a => ({href:a.href,text:a.innerText.trim()}))"""
-        )
+        if not rr.ok:
+            request.dispose()
+            raise RuntimeError(f"MSE news API HTTP {rr.status}")
+        items = rr.json()
+        request.dispose()
 
         candidates = []
-        for card in cards:
-            lines = [x.strip() for x in (card.get("text") or "").splitlines() if x.strip() and x.strip() != "·"]
-            if not lines:
+        for item in items if isinstance(items, list) else []:
+            if item.get("categorySlug") != "nogdol-ashig":
                 continue
-            ann = lines[0] if re.fullmatch(r'\d{4}-\d{2}-\d{2}', lines[0]) else ""
-            category = lines[1] if len(lines) > 1 else ""
-            title = lines[2] if len(lines) > 2 else ""
+            ann = str(item.get("publishedAt") or item.get("date") or "")[:10]
             if not ann:
                 continue
-            if category != "Ногдол ашиг" and "НОГДОЛ АШИГ" not in title.upper():
-                continue
+            # Existing data already covers historical announcements. Scan only
+            # the newest edge plus same-date late postings.
             if latest_ann and ann < latest_ann:
                 continue
-            href = card.get("href")
-            if not href or href in existing_urls:
+            slug = item.get("slug") or item.get("url")
+            if not slug:
                 continue
-            candidates.append((ann, href, title))
+            href = "https://new.mse.mn/news/" + slug.lstrip("/")
+            if href in existing_urls:
+                continue
+            candidates.append((ann, href, item.get("title") or item.get("name") or "", item.get("excerpt") or ""))
 
-        article = context.new_page()
-        for ann, href, title in candidates:
-            try:
-                rr = article.goto(href, wait_until="domcontentloaded", timeout=90000)
-                if rr and rr.status >= 400:
-                    print(f"[dividend] HTTP {rr.status}: {href}")
-                    continue
-                article.wait_for_timeout(2500)
-                body = article.locator("body").inner_text(timeout=15000)
+        if candidates:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+            context = _desktop_context(browser)
+            article = context.new_page()
+
+            for ann, href, title, excerpt in candidates:
                 try:
-                    h1 = article.locator("h1").first.inner_text(timeout=5000).strip()
-                    if h1:
-                        title = h1
-                except Exception:
-                    pass
-                row = _parse_dividend_article(data, ann, href, title, body)
-                if not row:
-                    continue
-                key = (
-                    row.get("ann"), row.get("sym"),
-                    None if row.get("dps") is None else round(float(row.get("dps")), 6)
-                )
-                if key in existing:
-                    continue
-                current.append(row)
-                existing.add(key)
-                existing_urls.add(href)
-                added.append(row)
-                print(
-                    f"[dividend] added {row['ann']} {row['sym']} "
-                    f"dps={row['dps']} total={row['tot']}"
-                )
-            except Exception as e:
-                print(f"[dividend] article warning {href}: {e}")
-        browser.close()
+                    resp = article.goto(href, wait_until="domcontentloaded", timeout=90000)
+                    if resp and resp.status >= 400:
+                        print(f"[dividend] HTTP {resp.status}: {href}")
+                        continue
+                    try:
+                        article.wait_for_load_state("networkidle", timeout=20000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    article.wait_for_timeout(1200)
+                    body = article.locator("body").inner_text(timeout=15000)
+                    try:
+                        h1 = article.locator("h1").first.inner_text(timeout=4000).strip()
+                        if h1:
+                            title = h1
+                    except Exception:
+                        pass
+
+                    row = _parse_dividend_article(
+                        data, ann, href, title,
+                        (excerpt + "\n" + body).strip()
+                    )
+                    if not row:
+                        continue
+                    key = (
+                        row.get("ann"), row.get("sym"),
+                        None if row.get("dps") is None else round(float(row.get("dps")), 6)
+                    )
+                    if key in existing:
+                        # Save source URL onto an old same announcement if possible.
+                        for old in current:
+                            oldkey = (
+                                old.get("ann"), old.get("sym"),
+                                None if old.get("dps") is None else round(float(old.get("dps")), 6)
+                            )
+                            if oldkey == key and not old.get("url"):
+                                old["url"] = href
+                                break
+                        existing_urls.add(href)
+                        continue
+
+                    current.append(row)
+                    existing.add(key)
+                    existing_urls.add(href)
+                    added.append(row)
+                    print(
+                        f"[dividend] added {row['ann']} {row['sym']} "
+                        f"dps={row['dps']} total={row['tot']}"
+                    )
+                except Exception as e:
+                    print(f"[dividend] article warning {href}: {e}")
+            browser.close()
 
     current.sort(key=lambda r: (r.get("ann",""), r.get("sym","")), reverse=True)
     anns = sorted(r.get("ann") for r in current if r.get("ann"))
@@ -969,4 +991,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-# dividend updater test trigger
