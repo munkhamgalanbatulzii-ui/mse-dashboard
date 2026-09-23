@@ -1045,7 +1045,11 @@ def main():
 
     # Funds, ABS, government securities and corporate bonds come from their
     # dedicated MSE server-action responses rather than HTML table positions.
-    # These status endpoints are the authoritative current-day feeds. Historical\n    # pages use different endpoint families, so never copy current rows into a\n    # missed historical date. Daily scheduled runs always fetch today directly.\n    other_targets = [today]\n    other_rows_by_date = fetch_other_days(other_targets, data)
+    # These status endpoints are the authoritative current-day feeds. Historical
+    # pages use different endpoint families, so never copy current rows into a
+    # missed historical date. Daily scheduled runs always fetch today directly.
+    other_targets = [today]
+    other_rows_by_date = fetch_other_days(other_targets, data)
     for od in other_targets:
         if od in other_rows_by_date:
             store_other_day(data, od, other_rows_by_date[od])
