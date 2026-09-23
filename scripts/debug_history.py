@@ -8,21 +8,21 @@ with sync_playwright() as p:
     page=browser.new_page(
         viewport={"width":1600,"height":1200}, locale="mn-MN", timezone_id="Asia/Ulaanbaatar",
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
-    reqs=[]
-    page.on("request",lambda req:reqs.append({"method":req.method,"url":req.url,"post":(req.post_data or "")[:500]}) if req.method=="POST" and "trade-daily-report" in req.url else None)
+    captured=[]
+    def on_resp(resp):
+        try:
+            post=resp.request.post_data or ""
+            if "tradingHistoryCs" in post and TARGET in post:
+                body=resp.text()
+                captured.append({"post":post,"status":resp.status,"ct":resp.headers.get("content-type"),"body":body[:12000]})
+        except Exception as e:
+            captured.append({"error":str(e)})
+    page.on("response",on_resp)
     page.goto("https://new.mse.mn/trade-daily-report",wait_until="domcontentloaded",timeout=90000)
-    page.wait_for_timeout(8000)
+    page.wait_for_timeout(7000)
     inp=page.locator('input[type="date"]')
-    print("[before]",inp.input_value())
     inp.evaluate("""(e,v)=>{const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));}""",TARGET)
-    page.wait_for_timeout(10000)
-    print("[after]",inp.input_value())
-    print("[body-date]", "2026-09-22" in page.locator("body").inner_text())
-    tables=page.eval_on_selector_all("table","""els=>els.map((t,i)=>({i,headers:Array.from(t.querySelectorAll('thead th')).map(x=>x.innerText.trim()),rows:Array.from(t.querySelectorAll('tbody tr')).map(tr=>Array.from(tr.querySelectorAll('td')).map(td=>td.innerText.trim())).filter(r=>r.some(Boolean))}))""")
-    for t in tables:
-        if t["rows"]:
-            print("[TABLE]",json.dumps({"i":t["i"],"headers":t["headers"],"n":len(t["rows"]),"first":t["rows"][0]},ensure_ascii=False))
-    for q in reqs[-50:]:
-        if TARGET in q["post"]:
-            print("[REQ]",json.dumps(q,ensure_ascii=False))
+    page.wait_for_timeout(20000)
+    for x in captured:
+        print("[RESP]",json.dumps(x,ensure_ascii=False))
     browser.close()
