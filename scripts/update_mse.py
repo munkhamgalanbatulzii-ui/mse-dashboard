@@ -564,6 +564,244 @@ def parse_block_table(rows, data, stock_close):
         out.append([sym, sym_name.get(sym,sym), float(price), int(qty), float(val), prem, ref])
     return out
 
+
+def _norm_company_name(s):
+    s = str(s or "").lower().replace("ё", "е")
+    s = re.sub(r'["“”«»‘’\']', "", s)
+    s = re.sub(r'\b(хк|ббсб)\b', " ", s)
+    return re.sub(r'[\W_]+', "", s, flags=re.UNICODE)
+
+def _latest_close_for_index(data, idx):
+    for d in reversed(data.get("dates", [])):
+        row = next((r for r in data.get("days", {}).get(d, []) if r[0] == idx), None)
+        if row:
+            return row[1]
+    return None
+
+def _match_dividend_symbol(data, title, body):
+    hay = _norm_company_name((title or "") + " " + (body or "")[:1400])
+    candidates = []
+    for i, s in enumerate(data.get("syms", [])):
+        name = _norm_company_name(s[1])
+        if name and len(name) >= 3 and name in hay:
+            candidates.append((len(name), i, s[0]))
+    for r in data.get("div", []):
+        name = _norm_company_name(r.get("name"))
+        idx = r.get("i")
+        if name and idx is not None and len(name) >= 3 and name in hay:
+            candidates.append((len(name), idx, r.get("sym")))
+    if not candidates:
+        return None, None
+    candidates.sort(reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+def _parse_money_number(s):
+    if s is None:
+        return None
+    t = re.sub(r'[\s,]', "", str(s))
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+def _parse_dividend_period(title, body, ann):
+    sample = ((title or "") + " " + (body or "")[:1200]).lower()
+    m = re.search(r'(\d{4})\s*оны\s*(?:эхний|нэгдүгээр)\s*хагас', sample)
+    if m:
+        return m.group(1) + " H1"
+    m = re.search(r'(\d{4})\s*оны\s*(?:хоёрдугаар|сүүлийн)\s*хагас', sample)
+    if m:
+        return m.group(1) + " H2"
+    m = re.search(r'(\d{4})\s*оны', (title or "").lower())
+    if m:
+        return m.group(1)
+    m = re.search(r'(\d{4})\s*оны', sample)
+    if m:
+        return m.group(1)
+    return ann[:4] if ann else ""
+
+def _extract_article_dates(text):
+    vals = []
+    for y,m,d in re.findall(
+        r'(20\d{2})\s*оны\s*(\d{1,2})\s*(?:дүгээр|дугаар)?\s*сарын\s*(\d{1,2})',
+        text or "",
+        flags=re.I
+    ):
+        try:
+            vals.append(date(int(y), int(m), int(d)).isoformat())
+        except Exception:
+            pass
+    for y,m,d in re.findall(r'(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})', text or ""):
+        try:
+            vals.append(date(int(y), int(m), int(d)).isoformat())
+        except Exception:
+            pass
+    return sorted(set(vals))
+
+def _parse_dividend_article(data, ann, href, card_title, article_text):
+    idx, sym = _match_dividend_symbol(data, card_title, article_text)
+    if idx is None or not sym:
+        print(f"[dividend] could not match company: {card_title}")
+        return None
+
+    text = article_text or ""
+    dps = None
+    patterns = [
+        r'(?:нэгж|нэг)\s+хувьцаа(?:нд|ны)?[^0-9]{0,80}([0-9][0-9,\s]*(?:\.[0-9]+)?)\s*(?:\([^)]{0,180}\)\s*)?төгрөг',
+        r'хувьцаа\s*(?:тус\s*бүрд|тутамд)[^0-9]{0,40}([0-9][0-9,\s]*(?:\.[0-9]+)?)\s*(?:\([^)]{0,180}\)\s*)?төгрөг',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            dps = _parse_money_number(m.group(1))
+            break
+
+    total = None
+    m = re.search(
+        r'нийт\s+([0-9][0-9,\s]*(?:\.[0-9]+)?)\s*(?:\([^)]{0,500}\)\s*)?'
+        r'төгрөг(?:ийн)?\s+ногдол\s+ашиг',
+        text,
+        flags=re.I,
+    )
+    if m:
+        total = _parse_money_number(m.group(1))
+
+    per = _parse_dividend_period(card_title, text, ann)
+    px = _latest_close_for_index(data, idx)
+    yld = (dps / px) if (dps is not None and px) else None
+
+    all_dates = _extract_article_dates(text)
+    future_dates = [d for d in all_dates if not ann or d >= ann]
+    note = ""
+    if future_dates:
+        latest = max(future_dates)
+        if latest > ann:
+            note = "Олголт " + latest + " хүртэл"
+
+    prev_name = next(
+        (r.get("name") for r in data.get("div", []) if r.get("sym") == sym and r.get("name")),
+        None
+    )
+    name = prev_name or data["syms"][idx][1]
+
+    return {
+        "sym": sym,
+        "i": idx,
+        "name": name,
+        "ann": ann,
+        "per": per,
+        "dps": dps,
+        "tot": total,
+        "px": px,
+        "yield_": yld,
+        "note": note,
+        "url": href,
+    }
+
+def update_dividend_news(data):
+    """Check MSE recent news for new dividend announcements and append them."""
+    today = datetime.now(TZ).date().isoformat()
+    current = data.setdefault("div", [])
+    latest_ann = max((r.get("ann","") for r in current), default="")
+    existing = {
+        (r.get("ann"), r.get("sym"), None if r.get("dps") is None else round(float(r.get("dps")), 6))
+        for r in current
+    }
+    existing_urls = {r.get("url") for r in current if r.get("url")}
+    added = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = _desktop_context(browser)
+        page = context.new_page()
+        resp = page.goto(
+            "https://new.mse.mn/investor-hub",
+            wait_until="domcontentloaded",
+            timeout=90000,
+        )
+        if resp and resp.status >= 400:
+            browser.close()
+            raise RuntimeError(f"MSE investor hub returned HTTP {resp.status}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(6000)
+
+        cards = page.eval_on_selector_all(
+            'a[href*="/news/"]',
+            """els => els.map(a => ({href:a.href,text:a.innerText.trim()}))"""
+        )
+
+        candidates = []
+        for card in cards:
+            lines = [x.strip() for x in (card.get("text") or "").splitlines() if x.strip() and x.strip() != "·"]
+            if not lines:
+                continue
+            ann = lines[0] if re.fullmatch(r'\d{4}-\d{2}-\d{2}', lines[0]) else ""
+            category = lines[1] if len(lines) > 1 else ""
+            title = lines[2] if len(lines) > 2 else ""
+            if not ann:
+                continue
+            if category != "Ногдол ашиг" and "НОГДОЛ АШИГ" not in title.upper():
+                continue
+            if latest_ann and ann < latest_ann:
+                continue
+            href = card.get("href")
+            if not href or href in existing_urls:
+                continue
+            candidates.append((ann, href, title))
+
+        article = context.new_page()
+        for ann, href, title in candidates:
+            try:
+                rr = article.goto(href, wait_until="domcontentloaded", timeout=90000)
+                if rr and rr.status >= 400:
+                    print(f"[dividend] HTTP {rr.status}: {href}")
+                    continue
+                article.wait_for_timeout(2500)
+                body = article.locator("body").inner_text(timeout=15000)
+                try:
+                    h1 = article.locator("h1").first.inner_text(timeout=5000).strip()
+                    if h1:
+                        title = h1
+                except Exception:
+                    pass
+                row = _parse_dividend_article(data, ann, href, title, body)
+                if not row:
+                    continue
+                key = (
+                    row.get("ann"), row.get("sym"),
+                    None if row.get("dps") is None else round(float(row.get("dps")), 6)
+                )
+                if key in existing:
+                    continue
+                current.append(row)
+                existing.add(key)
+                existing_urls.add(href)
+                added.append(row)
+                print(
+                    f"[dividend] added {row['ann']} {row['sym']} "
+                    f"dps={row['dps']} total={row['tot']}"
+                )
+            except Exception as e:
+                print(f"[dividend] article warning {href}: {e}")
+        browser.close()
+
+    current.sort(key=lambda r: (r.get("ann",""), r.get("sym","")), reverse=True)
+    anns = sorted(r.get("ann") for r in current if r.get("ann"))
+    meta = data.setdefault("divMeta", {})
+    meta["source"] = "mse.mn — Мэдээ, мэдээлэл → Ногдол ашиг"
+    meta["year"] = int(today[:4])
+    meta["n"] = len(current)
+    meta["range"] = (anns[0] + " → " + anns[-1]) if anns else ""
+    meta["lastChecked"] = today
+    meta["auto"] = True
+    return added
+
 def main():
     data = json.loads(DATA.read_text(encoding="utf-8"))
     today = datetime.now(TZ).date().isoformat()
@@ -706,6 +944,15 @@ def main():
     data["dates"] = sorted(set(data.get("dates", [])))
     if data["dates"]:
         data["latest"] = max(data["dates"])
+
+    # Dividend announcements are independent of trading activity. A temporary
+    # MSE news-page failure must not prevent the daily market update.
+    try:
+        new_dividends = update_dividend_news(data)
+        print(f"[dividend] scan complete: added={len(new_dividends)}")
+    except Exception as e:
+        print(f"[dividend] scan warning: {e}", file=sys.stderr)
+
     data["updated"] = datetime.now(TZ).isoformat(timespec="seconds")
 
     st = data.setdefault("stats", {})
