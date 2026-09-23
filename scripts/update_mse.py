@@ -375,6 +375,129 @@ def fetch_historical_stock_days(target_dates, data):
         browser.close()
     return result
 
+
+def fetch_block_days(target_dates, data, row_overrides=None):
+    """Fetch MNT block trades from MSE daily-report for exact dates."""
+    if not target_dates:
+        return {}
+    row_overrides = row_overrides or {}
+    result = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = _desktop_context(browser)
+        page = context.new_page()
+        resp = page.goto(
+            "https://new.mse.mn/trade-daily-report",
+            wait_until="domcontentloaded",
+            timeout=90000,
+        )
+        if resp and resp.status >= 400:
+            browser.close()
+            raise RuntimeError(f"MSE block report returned HTTP {resp.status}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(5000)
+        inp = page.locator('input[type="date"]')
+
+        for d in target_dates:
+            print(f"[blocks] loading {d}")
+            if inp.input_value() != d:
+                try:
+                    with page.expect_response(
+                        lambda r, td=d: (
+                            "trade-daily-report" in r.url
+                            and r.request.method == "POST"
+                            and td in (r.request.post_data or "")
+                            and "tradingHistoryCs1" in (r.request.post_data or "")
+                        ),
+                        timeout=30000,
+                    ):
+                        inp.evaluate(
+                            """(e,v)=>{
+                                const setter=Object.getOwnPropertyDescriptor(
+                                    HTMLInputElement.prototype,'value'
+                                ).set;
+                                setter.call(e,v);
+                                e.dispatchEvent(new Event('input',{bubbles:true}));
+                                e.dispatchEvent(new Event('change',{bubbles:true}));
+                            }""",
+                            d,
+                        )
+                except PlaywrightTimeoutError:
+                    pass
+
+            # Block tables hydrate slightly after the stock-history responses.
+            page.wait_for_timeout(3500)
+            tables = page.eval_on_selector_all(
+                "table",
+                """els => els.map((t,ti) => ({
+                    index: ti,
+                    headers: Array.from(t.querySelectorAll('thead th')).map(x => x.innerText.trim()),
+                    rows: Array.from(t.querySelectorAll('tbody tr')).map(tr =>
+                        Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
+                    ).filter(r => r.some(x => x && x.trim()))
+                }))"""
+            )
+            block_tables = [
+                t for t in tables
+                if t.get("headers", []) == ["Симбол","Дээд","Доод","Тоо ширхэг","Үнийн дүн"]
+            ]
+
+            # The first matching table is MNT; the second (when present) is USD.
+            raw = block_tables[0].get("rows", []) if block_tables else []
+            day_rows = row_overrides.get(d) or data.get("days", {}).get(d, [])
+            close_by_sym = {}
+            for rr in day_rows:
+                try:
+                    close_by_sym[data["syms"][rr[0]][0]] = rr[1]
+                except Exception:
+                    pass
+            name_by_sym = {s[0]: s[1] for s in data.get("syms", [])}
+
+            parsed = []
+            for r in raw:
+                if len(r) < 5:
+                    continue
+                sym = txt(r[0])
+                if not sym or sym.startswith("Энэ өдөр"):
+                    continue
+                qty = intnum(r[3], 0)
+                val = num(r[4], 0.0) or 0.0
+                if qty <= 0 or val <= 0:
+                    continue
+                price = val / qty
+                ref = close_by_sym.get(sym)
+                prem = round(price / ref - 1, 4) if ref else None
+                parsed.append([
+                    sym, name_by_sym.get(sym, sym),
+                    round(price, 6), int(qty), float(val), prem, ref
+                ])
+
+            result[d] = parsed
+            print(
+                f"[blocks] {d}: deals={len(parsed)} "
+                f"value={sum(x[4] for x in parsed):.2f}"
+            )
+
+        browser.close()
+    return result
+
+def store_block_day(data, d, block_rows):
+    """Store MNT block trades and keep summary block fields in sync."""
+    if block_rows:
+        data.setdefault("blocks", {})[d] = block_rows
+    else:
+        data.setdefault("blocks", {}).pop(d, None)
+    if d in data.get("summary", {}):
+        data["summary"][d][7] = len(block_rows)
+        data["summary"][d][8] = round(sum(r[4] for r in block_rows), 2)
+
 def store_stock_day(data, d, stock_rows):
     """Store one common-stock trading day and recompute alert/summary fields."""
     alerts = build_alerts(data, stock_rows, d)
@@ -506,6 +629,28 @@ def main():
         if repair_dates and all(d in completed for d in repair_dates):
             data["historyBackfillVersion"] = 2
 
+    # Repair/fill block trades independently from common-stock history.
+    block_repair_dates = []
+    if data.get("blockBackfillVersion", 0) < 2:
+        block_repair_dates = [
+            d for d in [
+                "2026-09-11","2026-09-14","2026-09-15","2026-09-16",
+                "2026-09-17","2026-09-18","2026-09-21","2026-09-22"
+            ]
+            if d < today
+        ]
+    block_targets = sorted(set(gap_dates + block_repair_dates + [today]))
+    block_rows_by_date = fetch_block_days(
+        block_targets,
+        data,
+        row_overrides={today: stock_rows} if stock_rows else {},
+    )
+    for bd in block_targets:
+        if bd in block_rows_by_date:
+            store_block_day(data, bd, block_rows_by_date[bd])
+    if block_repair_dates and all(d in block_rows_by_date for d in block_repair_dates):
+        data["blockBackfillVersion"] = 2
+
     # Today's alerts must be computed after backfill so rolling history is
     # continuous and signal calculations use the immediately preceding days.
     if stock_rows:
@@ -521,12 +666,7 @@ def main():
             if ti < len(tables):
                 other += parse_other_table(tables[ti].get("rows",[]), cat, ccy, data)
 
-        stock_close = {data["syms"][r[0]][0]:r[1] for r in stock_rows}
-        blocks = []
-        if 8 < len(tables):
-            blocks += parse_block_table(tables[8].get("rows",[]), data, stock_close)
-        if 9 < len(tables):
-            blocks += parse_block_table(tables[9].get("rows",[]), data, stock_close)
+        blocks = block_rows_by_date.get(today, [])
 
         alerts = build_alerts(data, stock_rows, today)
         stock_turn = sum(r[4] for r in stock_rows)
