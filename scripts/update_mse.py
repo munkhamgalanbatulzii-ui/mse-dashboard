@@ -376,6 +376,138 @@ def fetch_historical_stock_days(target_dates, data):
     return result
 
 
+
+OTHER_ENDPOINTS = {
+    "tradingXoc": ("Хөрөнгө оруулалтын сан", "MNT"),
+    "tradingAbs": ("Хөрөнгөөр баталгаажсан ҮЦ", "MNT"),
+    "tradingStatusZG": ("Засгийн газрын ҮЦ", "MNT"),
+    "tradingStatusXK": ("Компанийн бонд", "MNT"),
+    "tradingStatusUSD": ("Компанийн бонд", "USD"),
+}
+
+def _other_records_to_rows(records, category, ccy, data):
+    rows = []
+    for rec in records:
+        sym = txt(rec.get("companySymbol"))
+        if not sym:
+            continue
+        close = num(rec.get("ClosingPrice"), None)
+        qty = intnum(rec.get("Volume"), 0)
+        turn = num(rec.get("Turnover"), 0.0) or 0.0
+        retp = num(rec.get("changePercentage"), None)
+        if close is None or qty <= 0:
+            continue
+        name = previous_symbol_name(data, sym)
+        rows.append([
+            category, sym, name, ccy, float(close), int(qty),
+            float(turn), round((retp or 0.0) / 100.0, 4)
+        ])
+    return rows
+
+def fetch_other_days(target_dates, data):
+    """Fetch funds, ABS, government securities and corporate bonds from exact MSE responses."""
+    if not target_dates:
+        return {}
+
+    captures = {}
+    result = {}
+    expected = tuple(OTHER_ENDPOINTS.keys())
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = _desktop_context(browser)
+        page = context.new_page()
+
+        def on_response(resp):
+            try:
+                post = resp.request.post_data or ""
+                m = re.search(
+                    r'"url":"(tradingXoc|tradingAbs|tradingStatusZG|tradingStatusXK|tradingStatusUSD)".*?date=(\d{4}-\d{2}-\d{2})',
+                    post
+                )
+                if not m:
+                    return
+                endpoint, d = m.group(1), m.group(2)
+                captures.setdefault(d, {})[endpoint] = _parse_rsc_array(resp.text())
+            except Exception as e:
+                print(f"[other] response parse warning: {e}")
+
+        page.on("response", on_response)
+        resp = page.goto(
+            "https://new.mse.mn/trade-daily-report",
+            wait_until="domcontentloaded",
+            timeout=90000,
+        )
+        if resp and resp.status >= 400:
+            browser.close()
+            raise RuntimeError(f"MSE other-instruments report returned HTTP {resp.status}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(4000)
+
+        inp = page.locator('input[type="date"]')
+        for d in target_dates:
+            print(f"[other] loading {d}")
+
+            # Initial page load may already have captured the current date.
+            if not all(k in captures.get(d, {}) for k in expected):
+                inp.evaluate(
+                    """(e,v)=>{
+                        const setter=Object.getOwnPropertyDescriptor(
+                            HTMLInputElement.prototype,'value'
+                        ).set;
+                        setter.call(e,v);
+                        e.dispatchEvent(new Event('input',{bubbles:true}));
+                        e.dispatchEvent(new Event('change',{bubbles:true}));
+                    }""",
+                    d,
+                )
+
+            deadline = time.time() + 35
+            while time.time() < deadline:
+                if all(k in captures.get(d, {}) for k in expected):
+                    break
+                page.wait_for_timeout(250)
+
+            got = captures.get(d, {})
+            missing = [k for k in expected if k not in got]
+            if missing:
+                print(f"[other] {d}: missing responses={missing}")
+                continue
+
+            rows = []
+            for endpoint, (category, ccy) in OTHER_ENDPOINTS.items():
+                rows += _other_records_to_rows(
+                    got.get(endpoint, []), category, ccy, data
+                )
+            result[d] = rows
+            cats = {}
+            for r in rows:
+                cats[r[0] + ("/USD" if r[3] == "USD" else "")] = cats.get(
+                    r[0] + ("/USD" if r[3] == "USD" else ""), 0
+                ) + 1
+            print(f"[other] {d}: rows={len(rows)} categories={cats}")
+
+        browser.close()
+    return result
+
+def store_other_day(data, d, rows):
+    """Store non-equity exchange instruments and keep summary fields in sync."""
+    if rows:
+        data.setdefault("other", {})[d] = rows
+    else:
+        data.setdefault("other", {}).pop(d, None)
+
+    if d in data.get("summary", {}):
+        mnt_value = sum(r[6] for r in rows if r[3] == "MNT")
+        data["summary"][d][9] = round(mnt_value, 2)
+        data["summary"][d][10] = len(rows)
+
 def fetch_block_days(target_dates, data, row_overrides=None):
     """Fetch MNT block trades from MSE daily-report for exact dates."""
     if not target_dates:
@@ -911,21 +1043,18 @@ def main():
     if block_repair_dates and all(d in block_rows_by_date for d in block_repair_dates):
         data["blockBackfillVersion"] = 2
 
+    # Funds, ABS, government securities and corporate bonds come from their
+    # dedicated MSE server-action responses rather than HTML table positions.
+    other_targets = sorted(set(gap_dates + [today]))
+    other_rows_by_date = fetch_other_days(other_targets, data)
+    for od in other_targets:
+        if od in other_rows_by_date:
+            store_other_day(data, od, other_rows_by_date[od])
+
     # Today's alerts must be computed after backfill so rolling history is
     # continuous and signal calculations use the immediately preceding days.
     if stock_rows:
-        other = []
-        specs = [
-            (3, "Хөрөнгө оруулалтын сан", "MNT"),
-            (4, "Хөрөнгөөр баталгаажсан ҮЦ", "MNT"),
-            (5, "Засгийн газрын ҮЦ", "MNT"),
-            (6, "Компанийн бонд", "MNT"),
-            (7, "Компанийн бонд", "USD"),
-        ]
-        for ti, cat, ccy in specs:
-            if ti < len(tables):
-                other += parse_other_table(tables[ti].get("rows",[]), cat, ccy, data)
-
+        other = other_rows_by_date.get(today, [])
         blocks = block_rows_by_date.get(today, [])
 
         alerts = build_alerts(data, stock_rows, today)
