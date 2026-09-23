@@ -549,7 +549,7 @@ function render(){
   if(dn&&D.divMeta) dn.textContent="Ногдол ашиг: "+D.divMeta.source+" — "+D.divMeta.n+" зарлал"+(D.divMeta.lastChecked?" · сүүлд шалгасан "+D.divMeta.lastChecked:"")+". Өгөөж = НА ÷ сүүлийн хаалт.";
   var mn=document.getElementById("mcapNote");
   if(mn&&D.mcapMeta) mn.textContent="Зах зээлийн үнэлгээ: "+D.mcapMeta.source+" ("+D.mcapMeta.date+"). Бусад "+(D.stats.symbols-D.mcapMeta.n)+" симболын үнэлгээ нийтлэгдээгүй.";
-  document.getElementById("fstats").textContent = D.stats.rows.toLocaleString("en-US")+" мөр · "+D.stats.symbols+" симбол · нийт "+D.stats.alertsTotal.toLocaleString("en-US")+" дохио (4.59/өдөр)";
+  document.getElementById("fstats").textContent = D.stats.rows.toLocaleString("en-US")+" мөр · "+D.stats.symbols+" симбол · нийт "+D.stats.alertsTotal.toLocaleString("en-US")+" дохио ("+(D.stats.days?(D.stats.alertsTotal/D.stats.days).toFixed(2):"0.00")+"/өдөр)";
   document.getElementById("wlCount").textContent = SEL;
   draw14(); drawTurnover(); drawAlertBars(); renderClasses(); renderDiv(); renderStock(); renderBlocks(); filterTable();
 }
