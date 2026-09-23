@@ -356,6 +356,29 @@ tbody tr.pick.on{background:#0c1a22; box-shadow:inset 2px 0 0 var(--accent)}
   </section>
 
   <section class="panel" style="margin-top:16px">
+    <button type="button" class="pheadbtn" id="dvToggle" aria-expanded="false" aria-controls="dvPanel">
+      <span class="htitle"><h2>Ногдол ашиг · 2026</h2><span class="eyebrow" id="dvMeta"></span></span>
+      <span class="hint" id="dvHint"></span><span class="caret" aria-hidden="true">▶</span>
+    </button>
+    <div id="dvPanel" hidden>
+      <div class="tools">
+        <span class="eyebrow">Хамрах үе</span>
+        <div class="seg" role="group" aria-label="Хамрах үеийн шүүлтүүр">
+          <button type="button" data-pd="2026 H1" aria-pressed="true">2026 H1</button>
+          <button type="button" data-pd="all" aria-pressed="false">Бүгд</button>
+        </div>
+        <input type="search" id="dvQ" autocomplete="off"
+               placeholder="Симбол эсвэл нэрээр хайх" aria-label="Ногдол ашиг хайх">
+        <span class="muted" style="font-size:11px" id="dvShown"></span>
+      </div>
+      <div class="dvstats" id="dvStats"></div>
+      <div class="tscroll"><table style="min-width:900px">
+        <thead><tr><th>Зарласан</th><th>Симбол</th><th>Компани</th><th>Хамрах үе</th>
+          <th>НА / хувьцаа</th><th>Одоогийн ханш</th><th>Өгөөж</th><th>Нийт хуваарилах</th><th>Тэмдэглэл</th></tr></thead>
+        <tbody id="dvBody"></tbody>
+      </table></div>
+    </div>
+  </section>\n\n  <section class="panel" style="margin-top:16px">
     <div class="phead"><h2>Хувьцааны хяналтын жагсаалт</h2><span class="eyebrow" id="wlCount"></span></div>
     <div class="tools">
       <div class="seg" role="group" aria-label="Tier шүүлтүүр">
@@ -405,31 +428,6 @@ tbody tr.pick.on{background:#0c1a22; box-shadow:inset 2px 0 0 var(--accent)}
   </section>
 
 
-
-  <section class="panel" style="margin-top:14px">
-    <button type="button" class="pheadbtn" id="dvToggle" aria-expanded="false" aria-controls="dvPanel">
-      <span class="htitle"><h2>Ногдол ашиг · 2026</h2><span class="eyebrow" id="dvMeta"></span></span>
-      <span class="hint" id="dvHint"></span><span class="caret" aria-hidden="true">▶</span>
-    </button>
-    <div id="dvPanel" hidden>
-      <div class="tools">
-        <span class="eyebrow">Хамрах үе</span>
-        <div class="seg" role="group" aria-label="Хамрах үеийн шүүлтүүр">
-          <button type="button" data-pd="2026 H1" aria-pressed="true">2026 H1</button>
-          <button type="button" data-pd="all" aria-pressed="false">Бүгд</button>
-        </div>
-        <input type="search" id="dvQ" autocomplete="off"
-               placeholder="Симбол эсвэл нэрээр хайх" aria-label="Ногдол ашиг хайх">
-        <span class="muted" style="font-size:11px" id="dvShown"></span>
-      </div>
-      <div class="dvstats" id="dvStats"></div>
-      <div class="tscroll"><table style="min-width:900px">
-        <thead><tr><th>Зарласан</th><th>Симбол</th><th>Компани</th><th>Хамрах үе</th>
-          <th>НА / хувьцаа</th><th>Одоогийн ханш</th><th>Өгөөж</th><th>Нийт хуваарилах</th><th>Тэмдэглэл</th></tr></thead>
-        <tbody id="dvBody"></tbody>
-      </table></div>
-    </div>
-  </section>
 
   <section class="panel stk" id="stkPanel" aria-label="Хувьцааны ханшийн график">
     <div class="stkhead">
