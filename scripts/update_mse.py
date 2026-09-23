@@ -14,6 +14,7 @@ writing bad data.
 from __future__ import annotations
 
 import json
+import re
 import math
 import statistics
 import sys
@@ -239,12 +240,47 @@ def _desktop_context(browser):
         ),
     )
 
+def _parse_rsc_array(body):
+    """Parse the JSON array from a Next.js text/x-component server-action response."""
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("1:"):
+            payload = line[2:]
+            try:
+                obj = json.loads(payload)
+                return obj if isinstance(obj, list) else []
+            except Exception:
+                return []
+    return []
+
+def _history_records_to_rows(records, data):
+    rows = []
+    for rec in records:
+        sym = txt(rec.get("companySymbol"))
+        if not sym:
+            continue
+        close = num(rec.get("ClosingPrice"), None)
+        retp = num(rec.get("changePercentage"), None)
+        qty = intnum(rec.get("Volume"), 0)
+        turn = num(rec.get("Turnover"), 0.0) or 0.0
+        if close is None or qty <= 0:
+            continue
+        i = ensure_symbol(data, sym)
+        rows.append([
+            i, float(close),
+            round((retp or 0.0) / 100.0, 4),
+            int(qty), float(turn)
+        ])
+    return rows
+
 def fetch_historical_stock_days(target_dates, data):
-    """Fetch missing historical stock rows for specific dates from MSE daily report."""
+    """Fetch exact historical Cs1/Cs2/Cs3 JSON from MSE server-action responses."""
     if not target_dates:
         return {}
 
     result = {}
+    captures = {}
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -252,6 +288,23 @@ def fetch_historical_stock_days(target_dates, data):
         )
         context = _desktop_context(browser)
         page = context.new_page()
+
+        def on_response(resp):
+            try:
+                post = resp.request.post_data or ""
+                m = re.search(
+                    r'"url":"(tradingHistoryCs[123])".*?date=(\d{4}-\d{2}-\d{2})',
+                    post
+                )
+                if not m:
+                    return
+                endpoint, d = m.group(1), m.group(2)
+                records = _parse_rsc_array(resp.text())
+                captures.setdefault(d, {})[endpoint] = records
+            except Exception as e:
+                print(f"[backfill] response parse warning: {e}")
+
+        page.on("response", on_response)
         resp = page.goto(
             "https://new.mse.mn/trade-daily-report",
             wait_until="domcontentloaded",
@@ -269,62 +322,53 @@ def fetch_historical_stock_days(target_dates, data):
         inp = page.locator('input[type="date"]')
         for d in target_dates:
             print(f"[backfill] loading {d}")
-            try:
-                with page.expect_response(
-                    lambda r, td=d: (
-                        "trade-daily-report" in r.url
-                        and r.request.method == "POST"
-                        and td in (r.request.post_data or "")
-                        and "tradingHistoryCs1" in (r.request.post_data or "")
-                    ),
-                    timeout=30000,
-                ):
-                    inp.evaluate(
-                        """(e,v)=>{
-                            const setter=Object.getOwnPropertyDescriptor(
-                                HTMLInputElement.prototype,'value'
-                            ).set;
-                            setter.call(e,v);
-                            e.dispatchEvent(new Event('input',{bubbles:true}));
-                            e.dispatchEvent(new Event('change',{bubbles:true}));
-                        }""",
-                        d,
-                    )
-            except PlaywrightTimeoutError:
-                # The page can occasionally finish the historical requests before
-                # Playwright observes the selected response. Give hydration time
-                # and validate the rendered tables below.
-                pass
+            captures.pop(d, None)
 
-            page.wait_for_timeout(1800)
-            tables = page.eval_on_selector_all(
-                "table",
-                """els => els.map((t,ti) => ({
-                    index: ti,
-                    headers: Array.from(t.querySelectorAll('thead th')).map(x => x.innerText.trim()),
-                    rows: Array.from(t.querySelectorAll('tbody tr')).map(tr =>
-                        Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
-                    ).filter(r => r.some(x => x && x.trim()))
-                }))"""
+            # React's controlled input reacts to the native setter + input/change.
+            inp.evaluate(
+                """(e,v)=>{
+                    const setter=Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype,'value'
+                    ).set;
+                    setter.call(e,v);
+                    e.dispatchEvent(new Event('input',{bubbles:true}));
+                    e.dispatchEvent(new Event('change',{bubbles:true}));
+                }""",
+                d,
             )
 
-            detail = [
-                t for t in tables
-                if "Нээлт" in t.get("headers", [])
-                and "Өмнөх өдрийн хаалт" in t.get("headers", [])
-                and "Тоо ширхэг" in t.get("headers", [])
-                and "Үнийн дүн" in t.get("headers", [])
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                got = captures.get(d, {})
+                if all(k in got for k in (
+                    "tradingHistoryCs1",
+                    "tradingHistoryCs2",
+                    "tradingHistoryCs3",
+                )):
+                    break
+                page.wait_for_timeout(250)
+
+            got = captures.get(d, {})
+            missing = [
+                k for k in ("tradingHistoryCs1","tradingHistoryCs2","tradingHistoryCs3")
+                if k not in got
             ]
-            # MSE report orders common-stock categories I, II, III first.
+            if missing:
+                print(f"[backfill] {d}: missing responses={missing}")
+                continue
+
             stock_rows = []
-            for t in detail[:3]:
-                stock_rows += parse_history_stock_table(t.get("rows", []), data)
+            for k in ("tradingHistoryCs1","tradingHistoryCs2","tradingHistoryCs3"):
+                stock_rows += _history_records_to_rows(got[k], data)
 
             by_i = {r[0]: r for r in stock_rows}
             stock_rows = sorted(by_i.values(), key=lambda r: r[4], reverse=True)
             if stock_rows:
                 result[d] = stock_rows
-                print(f"[backfill] {d}: stocks={len(stock_rows)}")
+                print(
+                    f"[backfill] {d}: stocks={len(stock_rows)} "
+                    f"turnover={sum(r[4] for r in stock_rows):.2f}"
+                )
             else:
                 print(f"[backfill] {d}: no stock trades")
 
@@ -412,6 +456,14 @@ def main():
     by_i = {r[0]:r for r in stock_rows}
     stock_rows = sorted(by_i.values(), key=lambda r:r[4], reverse=True)
 
+    # If today's live page did not hydrate, use the same exact daily-report
+    # response path used for historical dates.
+    if not stock_rows:
+        exact_today = fetch_historical_stock_days([today], data)
+        stock_rows = exact_today.get(today, [])
+        if stock_rows:
+            print(f"[info] recovered today's stocks from daily report: {len(stock_rows)}")
+
     # Backfill any missing weekdays between the most recent stored trading date
     # and today. MSE's historical report will tell us whether a weekday actually
     # had stock trades; weekends are skipped up front.
@@ -428,13 +480,31 @@ def main():
                 gap_dates.append(ds)
             cur += timedelta(days=1)
 
-    if gap_dates:
-        print(f"[backfill] missing weekdays={gap_dates}")
-        historical = fetch_historical_stock_days(gap_dates, data)
-        for d in gap_dates:
+    # One-time repair for the 2026-09-14..22 historical gap. Version 1 used
+    # rendered DOM tables and could lag by one selected date; version 2 reads
+    # the exact server-action JSON and overwrites those dates correctly.
+    repair_dates = []
+    if data.get("historyBackfillVersion", 0) < 2:
+        repair_dates = [
+            d for d in [
+                "2026-09-14","2026-09-15","2026-09-16","2026-09-17",
+                "2026-09-18","2026-09-21","2026-09-22"
+            ]
+            if d < today
+        ]
+
+    targets = sorted(set(gap_dates + repair_dates))
+    if targets:
+        print(f"[backfill] targets={targets}")
+        historical = fetch_historical_stock_days(targets, data)
+        completed = []
+        for d in targets:
             rows = historical.get(d)
             if rows:
                 store_stock_day(data, d, rows)
+                completed.append(d)
+        if repair_dates and all(d in completed for d in repair_dates):
+            data["historyBackfillVersion"] = 2
 
     # Today's alerts must be computed after backfill so rolling history is
     # continuous and signal calculations use the immediately preceding days.
