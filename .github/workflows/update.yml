@@ -1,9 +1,6 @@
 name: Update MSE Dashboard
 
 on:
-  push:
-    paths:
-      - "scripts/update_mse.py"
   schedule:
     # 18:00 Ulaanbaatar = 10:00 UTC
     - cron: "0 10 * * *"
