@@ -131,7 +131,7 @@ def build_alerts(data, day_rows, trade_date):
     return alerts
 
 def get_tables():
-    """Load MSE page and return rendered tables, with diagnostics for client-side APIs."""
+    """Load the live MSE tables in a browser context that matches a normal desktop client."""
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -148,111 +148,39 @@ def get_tables():
             ),
         )
         page = context.new_page()
+        resp = page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+        if resp and resp.status >= 400:
+            browser.close()
+            raise RuntimeError(f"MSE page returned HTTP {resp.status}")
 
-        api_hits = []
-        failed = []
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
 
-        def on_response(resp):
-            try:
-                ct = (resp.headers.get("content-type") or "").lower()
-                url = resp.url
-                if "mse.mn" in url:
-                    rec = {"status": resp.status, "url": url, "content_type": ct}
-                    if "json" in ct:
-                        try:
-                            body = resp.text()
-                            rec["sample"] = body[:1200].replace("\n", " ")
-                        except Exception as e:
-                            rec["sample_error"] = str(e)
-                    api_hits.append(rec)
-            except Exception:
-                pass
-
-        def on_request_failed(req):
-            try:
-                failed.append({
-                    "url": req.url,
-                    "error": req.failure or "unknown"
-                })
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-        page.on("requestfailed", on_request_failed)
-        page.on("console", lambda msg: print(f"[browser-console] {msg.type}: {msg.text}"))
-
-        urls = [
-            "https://new.mse.mn/todays-trade",
-            "https://new.mse.mn/trade-daily-report",
-        ]
-
-        all_tables = []
-        for target in urls:
-            print(f"[diag] opening {target}")
-            try:
-                resp = page.goto(target, wait_until="domcontentloaded", timeout=90000)
-                print(f"[diag] goto status={resp.status if resp else 'none'} final_url={page.url}")
-            except Exception as e:
-                print(f"[diag] goto error: {e}")
-                continue
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=30000)
-            except PlaywrightTimeoutError:
-                print("[diag] networkidle timeout; continuing")
-
-            page.wait_for_timeout(12000)
-
-            try:
-                print(f"[diag] title={page.title()!r}")
-                body = page.locator("body").inner_text(timeout=10000)
-                print("[diag] body sample=" + body[:2500].replace("\n", " | "))
-            except Exception as e:
-                print(f"[diag] body read error: {e}")
-
-            tables = page.eval_on_selector_all(
-                "table",
-                """els => els.map((t,ti) => ({
-                    index: ti,
-                    headers: Array.from(t.querySelectorAll('thead th')).map(x => x.innerText.trim()),
-                    rows: Array.from(t.querySelectorAll('tbody tr')).map(tr =>
-                        Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
-                    ).filter(r => r.some(x => x && x.trim()))
-                }))"""
+        # MSE hydrates its trading tables client-side. A real desktop UA plus
+        # a longer hydration window was required on GitHub-hosted runners.
+        try:
+            page.wait_for_function(
+                """() => Array.from(document.querySelectorAll('table tbody tr'))
+                    .some(r => r.querySelectorAll('td').length >= 11)""",
+                timeout=45000,
             )
-            print(f"[diag] {target} tables={len(tables)} nonempty={sum(1 for t in tables if t.get('rows'))}")
-            if tables:
-                for ti,t in enumerate(tables[:12]):
-                    print(f"[diag] table {ti} headers={t.get('headers',[])[:16]} rows={len(t.get('rows',[]))}")
-                    if t.get("rows"):
-                        print(f"[diag] table {ti} firstrow={t['rows'][0][:16]}")
-                all_tables = tables
-                if any(t.get("rows") for t in tables):
-                    break
+        except PlaywrightTimeoutError:
+            page.wait_for_timeout(5000)
 
-            # Some React data grids use div[role=row] instead of <table>.
-            try:
-                role_rows = page.eval_on_selector_all(
-                    '[role="row"]',
-                    """els => els.slice(0,12).map(r =>
-                        Array.from(r.querySelectorAll('[role="cell"],[role="gridcell"],[role="columnheader"]'))
-                          .map(x => x.innerText.trim())
-                    )"""
-                )
-                if role_rows:
-                    print(f"[diag] role=row count(sampled)={len(role_rows)} sample={role_rows[:3]}")
-            except Exception as e:
-                print(f"[diag] role-row error: {e}")
-
-        print(f"[diag] mse responses captured={len(api_hits)} failed_requests={len(failed)}")
-        for rec in api_hits[-80:]:
-            if rec.get("sample") or any(k in rec["url"].lower() for k in ("api","trade","market","price","security","report")):
-                print("[diag-response] " + json.dumps(rec, ensure_ascii=False))
-        for rec in failed[-30:]:
-            print("[diag-failed] " + json.dumps(rec, ensure_ascii=False))
-
+        tables = page.eval_on_selector_all(
+            "table",
+            """els => els.map((t,ti) => ({
+                index: ti,
+                headers: Array.from(t.querySelectorAll('thead th')).map(x => x.innerText.trim()),
+                rows: Array.from(t.querySelectorAll('tbody tr')).map(tr =>
+                    Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
+                ).filter(r => r.some(x => x && x.trim()))
+            }))"""
+        )
         browser.close()
-        return all_tables
+        return tables
 
 def pick_nonempty(tables):
     return [t for t in tables if t.get("rows")]
