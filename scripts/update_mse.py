@@ -74,62 +74,356 @@ def ensure_symbol(data, sym, name=None):
     print(f"[info] new symbol appended as Tier D: {sym}", file=sys.stderr)
     return i
 
-def prior_trade_rows(data, sym_idx, limit=60):
-    vals = []
-    last_date = None
-    for d in reversed(data.get("dates", [])):
+SIGNAL_CFG = {
+    "k_up": 2.5,
+    "k_dn": 1.5,
+    "tier_A_cov": 0.95,
+    "tier_A_adtv": 5_000_000,
+    "tier_B_cov": 0.32,
+    "tier_B_adtv": 500_000,
+    "tier_D_cov": 0.10,
+    "floor": {"A": 0.025, "B": 0.040, "C": 0.060, "D": 0.100},
+    "minTurn": {"A": 1_000_000, "B": 500_000, "C": 200_000, "D": 2_000_000},
+    "hardMinTurnover": 500_000,
+    "rvolCritical": 5,
+    "rvolInfo": 8,
+    "critMult": 1.5,
+    "limit": 0.145,
+    "newSymMove": 0.10,
+    "newSymTurn": 2_000_000,
+    "rvolWindow": 20,
+    "cooldownDays": 3,
+}
+SIGNAL_SEV = {"CRITICAL": 0, "WATCH": 1, "INFO": 2}
+
+def _js_round(x):
+    """Match JavaScript Math.round for the positive calibration quantities used here."""
+    return math.floor(x + 0.5)
+
+def _r4(x):
+    return _js_round(x * 1e4) / 1e4
+
+def _sig_mean(a):
+    return sum(a) / len(a) if a else 0.0
+
+def _sig_stdev(a):
+    """Sample standard deviation, n-1, matching the supplied SignalEngine."""
+    if len(a) < 2:
+        return None
+    m = _sig_mean(a)
+    return math.sqrt(sum((x - m) ** 2 for x in a) / (len(a) - 1))
+
+def signal_classify_tier(coverage, adtv, cfg=SIGNAL_CFG):
+    if coverage < cfg["tier_D_cov"]:
+        return "D"
+    if coverage >= cfg["tier_A_cov"] and adtv >= cfg["tier_A_adtv"]:
+        return "A"
+    if coverage >= cfg["tier_B_cov"] and adtv >= cfg["tier_B_adtv"]:
+        return "B"
+    return "C"
+
+def _daily_returns(closes):
+    out = []
+    for i in range(1, len(closes)):
+        a, b = closes[i - 1], closes[i]
+        if a > 0 and b > 0:
+            out.append(b / a - 1)
+    return out
+
+def signal_calibrate_symbol(symbol, closes, turnovers, market_days, cfg=SIGNAL_CFG):
+    coverage = (
+        _js_round((len(turnovers) / market_days) * 1000) / 1000
+        if market_days else 0.0
+    )
+    adtv = _sig_mean(turnovers)
+    tier = signal_classify_tier(coverage, adtv, cfg)
+    rets = _daily_returns(closes)
+    sigma = _r4(_sig_stdev(rets)) if tier != "D" and len(rets) >= 5 else None
+    floor = cfg["floor"][tier]
+    if sigma is None:
+        up_thr = floor
+        dn_thr = floor
+    else:
+        up_thr = _r4(max(cfg["k_up"] * sigma, floor))
+        dn_thr = _r4(max(cfg["k_dn"] * sigma, floor))
+    med = statistics.median(turnovers) if turnovers else 0
+    min_turn = max(cfg["minTurn"][tier], _js_round(0.5 * med))
+    return {
+        "symbol": symbol,
+        "tier": tier,
+        "sigma": sigma,
+        "upThr": up_thr,
+        "dnThr": dn_thr,
+        "minTurnover": min_turn,
+        "adtv": adtv,
+        "coverage": coverage,
+        "nTraded": len(turnovers),
+    }
+
+def signal_rvol_base(turnovers, cfg=SIGNAL_CFG):
+    vals = [t for t in turnovers[-cfg["rvolWindow"]:] if t > 0]
+    return statistics.median(vals) if vals else None
+
+def _pc(x, digits=1):
+    return ("+" if x >= 0 else "") + f"{x * 100:.{digits}f}%"
+
+def signal_score_symbol(symbol, close, prev_close, turnover, cal, rv_base, cfg=SIGNAL_CFG):
+    ret = (close / prev_close - 1) if (prev_close is not None and prev_close > 0) else None
+    rvol = (turnover / rv_base) if (rv_base is not None and rv_base > 0) else 0.0
+
+    if cal is None:
+        if (
+            ret is not None
+            and abs(ret) >= cfg["newSymMove"]
+            and turnover >= cfg["newSymTurn"]
+        ):
+            return {
+                "symbol": symbol,
+                "severity": "WATCH",
+                "rule": "NEW_SYMBOL",
+                "ret": ret,
+                "rvol": rvol,
+                "turnover": turnover,
+                "close": close,
+                "threshold": cfg["newSymMove"],
+                "reason": "шинэ симбол " + _pc(ret),
+            }
+        return None
+
+    liquid = (
+        turnover >= cal["minTurnover"]
+        and turnover >= cfg["hardMinTurnover"]
+    )
+
+    # A — exchange near-limit move. Exact supplied thresholds retained.
+    if (
+        ret is not None
+        and abs(ret) >= cfg["limit"]
+        and turnover >= cfg["hardMinTurnover"]
+    ):
+        return {
+            "symbol": symbol,
+            "severity": "CRITICAL",
+            "rule": "LIMIT",
+            "ret": ret,
+            "rvol": rvol,
+            "turnover": turnover,
+            "close": close,
+            "threshold": cfg["limit"],
+            "reason": "өдрийн хязгаар " + _pc(ret),
+        }
+
+    if not liquid:
+        return None
+
+    # B — abnormal price move.
+    threshold = None
+    rule = None
+    if ret is not None and ret >= cal["upThr"]:
+        threshold = cal["upThr"]
+        rule = "UP"
+    elif ret is not None and ret <= -cal["dnThr"]:
+        threshold = cal["dnThr"]
+        rule = "DOWN"
+
+    if threshold is not None:
+        critical = (
+            rvol >= cfg["rvolCritical"]
+            or abs(ret) >= cfg["critMult"] * threshold
+        )
+        why = []
+        if rvol >= cfg["rvolCritical"]:
+            why.append(f"RVOL {rvol:.1f}×")
+        if abs(ret) >= cfg["critMult"] * threshold:
+            why.append(f"хязгаарын {abs(ret) / threshold:.1f}×")
+        return {
+            "symbol": symbol,
+            "severity": "CRITICAL" if critical else "WATCH",
+            "rule": rule,
+            "ret": ret,
+            "rvol": rvol,
+            "turnover": turnover,
+            "close": close,
+            "threshold": threshold,
+            "reason": (
+                _pc(ret)
+                + f" (хязгаар {threshold * 100:.1f}%)"
+                + (" · " + ", ".join(why) if why else "")
+            ),
+        }
+
+    # C — turnover spike. The supplied engine names this RVOL; mathematically
+    # it is today's turnover / median turnover of the last 20 traded days.
+    if rvol >= cfg["rvolInfo"]:
+        return {
+            "symbol": symbol,
+            "severity": "INFO",
+            "rule": "VOLUME_SPIKE",
+            "ret": ret,
+            "rvol": rvol,
+            "turnover": turnover,
+            "close": close,
+            "threshold": None,
+            "reason": (
+                f"эзлэхүүн {rvol:.1f}×"
+                + ((" ханш " + _pc(ret)) if ret is not None else "")
+            ),
+        }
+    return None
+
+def rebuild_signal_engine(data):
+    """Recompute every historical alert walk-forward from the supplied engine.
+
+    Correctness improvements do not change any threshold:
+    - each day is calibrated only on information available before that day;
+    - prevClose is the last traded close before the scored day;
+    - RVOL uses turnover (not share volume), median of last 20 traded days;
+    - sample stdev uses n-1;
+    - cooldown is measured in market-day index, exactly as scoreDay(dayIdx).
+    """
+    dates = sorted(set(data.get("dates", [])))
+    history = {}  # idx -> [{"date","close","turnover"}]
+    last_idx = {}
+    alerts_by_date = {}
+    market_days_seen = 0
+
+    for day_idx, d in enumerate(dates):
         rows = data.get("days", {}).get(d, [])
-        row = next((r for r in rows if r[0] == sym_idx), None)
-        if row:
-            if last_date is None:
-                last_date = d
-            vals.append(row)
-            if len(vals) >= limit:
-                break
-    return vals, last_date
+        out = []
 
-def build_alerts(data, day_rows, trade_date):
-    alerts = []
-    for r in day_rows:
-        i, close, ret, qty, turnover = r
-        th = data.get("thr", {}).get(str(i), [0.20,0.12,0.08,100000,500000,0.25])
-        up_thr, dn_thr, sigma, min_turn = th[0], th[1], th[2], th[3]
-        ret = ret or 0.0
-        event = None
+        for r in rows:
+            idx, close, _reported_ret, _qty, turnover = r
+            sym = data["syms"][idx][0]
+            hist = history.get(idx, [])
+            closes = [x["close"] for x in hist]
+            turns = [x["turnover"] for x in hist]
 
-        # Price alerts: same concept documented in the dashboard footer.
-        if turnover >= min_turn and ret >= up_thr:
-            ratio = ret / up_thr if up_thr else 0
-            sev = "CRITICAL" if ratio >= 1.5 else "WATCH"
-            event = [i, sev, round(ret,4), round(ratio,1), "PRICE_UP"]
-        elif turnover >= min_turn and ret <= -dn_thr:
-            ratio = abs(ret) / dn_thr if dn_thr else 0
-            sev = "CRITICAL" if ratio >= 1.5 else "WATCH"
-            event = [i, sev, round(ret,4), round(ratio,1), "PRICE_DOWN"]
+            cal = (
+                signal_calibrate_symbol(sym, closes, turns, market_days_seen)
+                if hist else None
+            )
+            prev_close = hist[-1]["close"] if hist else None
+            rv_base = signal_rvol_base(turns)
+            alert = signal_score_symbol(
+                sym, close, prev_close, turnover, cal, rv_base
+            )
+            if not alert:
+                continue
 
-        if event is None:
-            hist, last_trade = prior_trade_rows(data, i, 60)
-            vols = [x[3] for x in hist if x[3] and x[3] > 0]
-            med = statistics.median(vols) if vols else 0
-            vr = qty / med if med else 0
-            reopened = False
-            if last_trade:
-                try:
-                    reopened = (date.fromisoformat(trade_date) - date.fromisoformat(last_trade)).days >= 20
-                except Exception:
-                    pass
-            if vr >= 5:
-                code = "VOLUME_SPIKE+REOPEN" if reopened else "VOLUME_SPIKE"
-                event = [i, "INFO", round(ret,4), round(vr,1), code]
-            elif reopened and turnover >= min_turn:
-                event = [i, "INFO", round(ret,4), 1.0, "REOPEN"]
+            if (
+                alert["severity"] != "CRITICAL"
+                and day_idx - last_idx.get(sym, -10**9) < SIGNAL_CFG["cooldownDays"]
+            ):
+                continue
 
-        if event:
-            alerts.append(event)
+            last_idx[sym] = day_idx
+            out.append([
+                idx,
+                alert["severity"],
+                _r4(alert["ret"]) if alert["ret"] is not None else 0.0,
+                round(alert["rvol"], 1),
+                alert["rule"],
+                round(alert["turnover"], 2),
+                alert["close"],
+                alert["threshold"],
+                alert["reason"],
+            ])
 
-    order = {"CRITICAL":0,"WATCH":1,"INFO":2}
-    alerts.sort(key=lambda a:(order.get(a[1],9), -abs(a[2] or 0)))
-    return alerts
+        out.sort(
+            key=lambda a: (
+                SIGNAL_SEV.get(a[1], 9),
+                -abs(a[2] or 0),
+            )
+        )
+        alerts_by_date[d] = out
+
+        # Only after scoring may today's information enter tomorrow's calibration.
+        if rows:
+            for r in rows:
+                idx, close, _ret, _qty, turnover = r
+                history.setdefault(idx, []).append({
+                    "date": d,
+                    "close": float(close),
+                    "turnover": float(turnover),
+                })
+            market_days_seen += 1
+
+    data["alerts"] = alerts_by_date
+
+    # Latest calibration is the threshold set displayed in the watchlist and is
+    # what will be used for the next trading day.
+    thr = {}
+    for idx, s in enumerate(data.get("syms", [])):
+        hist = history.get(idx, [])
+        if hist:
+            cal = signal_calibrate_symbol(
+                s[0],
+                [x["close"] for x in hist],
+                [x["turnover"] for x in hist],
+                market_days_seen,
+            )
+            s[2] = cal["tier"]
+            thr[str(idx)] = [
+                cal["upThr"],
+                cal["dnThr"],
+                cal["sigma"],
+                cal["minTurnover"],
+                cal["adtv"],
+                cal["coverage"],
+            ]
+        else:
+            s[2] = "D"
+            thr[str(idx)] = [
+                SIGNAL_CFG["floor"]["D"],
+                SIGNAL_CFG["floor"]["D"],
+                None,
+                SIGNAL_CFG["minTurn"]["D"],
+                0,
+                0,
+            ]
+    data["thr"] = thr
+
+    # Keep summary counters synchronized with the newly rebuilt engine.
+    for d in dates:
+        sm = data.setdefault("summary", {}).setdefault(
+            d, [0,0,0,0,0,0,0,0,0,0,0]
+        )
+        while len(sm) < 11:
+            sm.append(0)
+        al = alerts_by_date.get(d, [])
+        sm[5] = len(al)
+        sm[6] = sum(1 for a in al if a[1] == "CRITICAL")
+
+    data["signalConfig"] = {
+        "k_up": SIGNAL_CFG["k_up"],
+        "k_dn": SIGNAL_CFG["k_dn"],
+        "tier_A_cov": SIGNAL_CFG["tier_A_cov"],
+        "tier_A_adtv": SIGNAL_CFG["tier_A_adtv"],
+        "tier_B_cov": SIGNAL_CFG["tier_B_cov"],
+        "tier_B_adtv": SIGNAL_CFG["tier_B_adtv"],
+        "tier_D_cov": SIGNAL_CFG["tier_D_cov"],
+        "floor": SIGNAL_CFG["floor"],
+        "minTurn": SIGNAL_CFG["minTurn"],
+        "hardMinTurnover": SIGNAL_CFG["hardMinTurnover"],
+        "rvolCritical": SIGNAL_CFG["rvolCritical"],
+        "rvolInfo": SIGNAL_CFG["rvolInfo"],
+        "critMult": SIGNAL_CFG["critMult"],
+        "limit": SIGNAL_CFG["limit"],
+        "newSymMove": SIGNAL_CFG["newSymMove"],
+        "newSymTurn": SIGNAL_CFG["newSymTurn"],
+        "rvolWindow": SIGNAL_CFG["rvolWindow"],
+        "cooldownDays": SIGNAL_CFG["cooldownDays"],
+    }
+    data["signalMeta"] = {
+        "engine": "SignalEngine supplied by user",
+        "version": 2,
+        "calibration": "walk-forward; prior data only",
+        "rvolBasis": "turnover / median(last 20 traded-day turnover)",
+        "stdev": "sample n-1",
+        "thresholdsChanged": False,
+    }
+    return alerts_by_date
+
 
 def get_tables():
     """Load the live MSE tables in a browser context that matches a normal desktop client."""
@@ -631,19 +925,14 @@ def store_block_day(data, d, block_rows):
         data["summary"][d][8] = round(sum(r[4] for r in block_rows), 2)
 
 def store_stock_day(data, d, stock_rows):
-    """Store one common-stock trading day and recompute alert/summary fields."""
-    alerts = build_alerts(data, stock_rows, d)
+    """Store one common-stock trading day; signals are rebuilt walk-forward later."""
     stock_turn = sum(r[4] for r in stock_rows)
     qty = sum(r[3] for r in stock_rows)
     up = sum(1 for r in stock_rows if (r[2] or 0) > 0)
     down = sum(1 for r in stock_rows if (r[2] or 0) < 0)
-    crit = sum(1 for a in alerts if a[1] == "CRITICAL")
 
     data.setdefault("days", {})[d] = stock_rows
-    data.setdefault("alerts", {})[d] = alerts
 
-    # Historical backfill is stock-level. Other-security and block-trade
-    # fields remain zero unless separately available.
     old = data.setdefault("summary", {}).get(d)
     block_count = old[7] if old and len(old) > 7 else 0
     block_value = old[8] if old and len(old) > 8 else 0
@@ -651,8 +940,8 @@ def store_stock_day(data, d, stock_rows):
     other_count = old[10] if old and len(old) > 10 else 0
 
     data["summary"][d] = [
-        round(stock_turn,2), len(stock_rows), up, down, qty,
-        len(alerts), crit, block_count, block_value, other_value, other_count
+        round(stock_turn, 2), len(stock_rows), up, down, qty,
+        0, 0, block_count, block_value, other_value, other_count
     ]
     if d not in data["dates"]:
         data["dates"].append(d)
@@ -1060,17 +1349,14 @@ def main():
         other = other_rows_by_date.get(today, [])
         blocks = block_rows_by_date.get(today, [])
 
-        alerts = build_alerts(data, stock_rows, today)
         stock_turn = sum(r[4] for r in stock_rows)
         qty = sum(r[3] for r in stock_rows)
         up = sum(1 for r in stock_rows if (r[2] or 0) > 0)
         down = sum(1 for r in stock_rows if (r[2] or 0) < 0)
-        crit = sum(1 for a in alerts if a[1] == "CRITICAL")
         block_val = sum(b[4] for b in blocks)
         other_val = sum(o[6] for o in other if o[3] == "MNT")
 
         data.setdefault("days", {})[today] = stock_rows
-        data.setdefault("alerts", {})[today] = alerts
         if other:
             data.setdefault("other", {})[today] = other
         else:
@@ -1082,14 +1368,14 @@ def main():
 
         data.setdefault("summary", {})[today] = [
             round(stock_turn,2), len(stock_rows), up, down, qty,
-            len(alerts), crit, len(blocks), round(block_val,2),
+            0, 0, len(blocks), round(block_val,2),
             round(other_val,2), len(other)
         ]
         if today not in data["dates"]:
             data["dates"].append(today)
             data["dates"].sort()
         print(
-            f"[ok] {today}: stocks={len(stock_rows)} alerts={len(alerts)} "
+            f"[ok] {today}: stocks={len(stock_rows)} "
             f"other={len(other)} blocks={len(blocks)}"
         )
     else:
@@ -1098,6 +1384,14 @@ def main():
     data["dates"] = sorted(set(data.get("dates", [])))
     if data["dates"]:
         data["latest"] = max(data["dates"])
+
+    rebuild_signal_engine(data)
+    latest_alerts = data.get("alerts", {}).get(data.get("latest"), [])
+    print(
+        f"[signals] engine rebuild complete: latest={data.get('latest')} "
+        f"alerts={len(latest_alerts)} critical="
+        f"{sum(1 for a in latest_alerts if a[1] == 'CRITICAL')}"
+    )
 
     # Dividend announcements are independent of trading activity. A temporary
     # MSE news-page failure must not prevent the daily market update.
