@@ -6,7 +6,12 @@ with sync_playwright() as p:
     page=b.new_page(viewport={"width":1600,"height":1200},locale="mn-MN",timezone_id="Asia/Ulaanbaatar",
       user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
     page.goto("https://new.mse.mn/investor-hub",wait_until="domcontentloaded",timeout=90000)
-    page.wait_for_timeout(10000)
-    links=page.eval_on_selector_all('a[href*="/news/"]',"""els=>els.map(a=>({href:a.href,text:a.innerText.trim(),outer:a.outerHTML.slice(0,1600)}))""")
+    page.wait_for_timeout(8000)
+    btn=page.get_by_role("button",name="Ногдол ашиг")
+    print("[BTNCOUNT]",btn.count())
+    if btn.count():
+        btn.first.click()
+        page.wait_for_timeout(8000)
+    links=page.eval_on_selector_all('a[href*="/news/"]',"""els=>els.map(a=>({href:a.href,text:a.innerText.trim()}))""")
     print("[LINKS]",json.dumps(links,ensure_ascii=False))
     b.close()
