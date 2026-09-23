@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from playwright.sync_api import sync_playwright
 import json
-TARGET="2026-09-23"
+TARGET="2026-09-10"
 with sync_playwright() as p:
     b=p.chromium.launch(headless=True,args=["--disable-blink-features=AutomationControlled"])
     page=b.new_page(viewport={"width":1600,"height":1200},locale="mn-MN",timezone_id="Asia/Ulaanbaatar",
