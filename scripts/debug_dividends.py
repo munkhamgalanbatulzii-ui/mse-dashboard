@@ -21,7 +21,7 @@ with sync_playwright() as p:
                 resp.append({"post":post[:1000],"status":x.status,"ct":x.headers.get("content-type"),"body":x.text()[:12000]})
         except: pass
     page.on("request",rq); page.on("response",rs)
-    page.goto("https://new.mse.mn/live-market",wait_until="domcontentloaded",timeout=90000)
+    page.goto("https://new.mse.mn/investor-hub",wait_until="domcontentloaded",timeout=90000)
     page.wait_for_timeout(15000)
     print("[BODY]", page.locator("body").inner_text()[:6000].replace("\n"," | "))
     for x in req: print("[REQ]",json.dumps(x,ensure_ascii=False))
