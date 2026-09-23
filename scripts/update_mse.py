@@ -204,6 +204,162 @@ def parse_stock_table(rows, data):
         out.append([i, float(close), round(ret,4), int(qty), float(turn)])
     return out
 
+
+def parse_history_stock_table(rows, data):
+    """Parse one historical common-stock category table from trade-daily-report."""
+    out = []
+    for c in rows:
+        # Historical detail columns:
+        # sym, open, high, low, prev_close, close, change, pct, qty, turnover, ...
+        if len(c) < 10:
+            continue
+        sym = txt(c[0])
+        if not sym or sym.startswith("Энэ өдөр") or len(sym) > 32:
+            continue
+        close = num(c[5], None)
+        retp = num(c[7], None)
+        qty = intnum(c[8], 0)
+        turn = num(c[9], 0.0) or 0.0
+        if close is None or qty <= 0:
+            continue
+        i = ensure_symbol(data, sym)
+        ret = (retp / 100.0) if retp is not None else 0.0
+        out.append([i, float(close), round(ret,4), int(qty), float(turn)])
+    return out
+
+def _desktop_context(browser):
+    return browser.new_context(
+        viewport={"width": 1600, "height": 1200},
+        locale="mn-MN",
+        timezone_id="Asia/Ulaanbaatar",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/153.0.0.0 Safari/537.36"
+        ),
+    )
+
+def fetch_historical_stock_days(target_dates, data):
+    """Fetch missing historical stock rows for specific dates from MSE daily report."""
+    if not target_dates:
+        return {}
+
+    result = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = _desktop_context(browser)
+        page = context.new_page()
+        resp = page.goto(
+            "https://new.mse.mn/trade-daily-report",
+            wait_until="domcontentloaded",
+            timeout=90000,
+        )
+        if resp and resp.status >= 400:
+            browser.close()
+            raise RuntimeError(f"MSE history page returned HTTP {resp.status}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(5000)
+
+        inp = page.locator('input[type="date"]')
+        for d in target_dates:
+            print(f"[backfill] loading {d}")
+            try:
+                with page.expect_response(
+                    lambda r, td=d: (
+                        "trade-daily-report" in r.url
+                        and r.request.method == "POST"
+                        and td in (r.request.post_data or "")
+                        and "tradingHistoryCs1" in (r.request.post_data or "")
+                    ),
+                    timeout=30000,
+                ):
+                    inp.evaluate(
+                        """(e,v)=>{
+                            const setter=Object.getOwnPropertyDescriptor(
+                                HTMLInputElement.prototype,'value'
+                            ).set;
+                            setter.call(e,v);
+                            e.dispatchEvent(new Event('input',{bubbles:true}));
+                            e.dispatchEvent(new Event('change',{bubbles:true}));
+                        }""",
+                        d,
+                    )
+            except PlaywrightTimeoutError:
+                # The page can occasionally finish the historical requests before
+                # Playwright observes the selected response. Give hydration time
+                # and validate the rendered tables below.
+                pass
+
+            page.wait_for_timeout(1800)
+            tables = page.eval_on_selector_all(
+                "table",
+                """els => els.map((t,ti) => ({
+                    index: ti,
+                    headers: Array.from(t.querySelectorAll('thead th')).map(x => x.innerText.trim()),
+                    rows: Array.from(t.querySelectorAll('tbody tr')).map(tr =>
+                        Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
+                    ).filter(r => r.some(x => x && x.trim()))
+                }))"""
+            )
+
+            detail = [
+                t for t in tables
+                if "Нээлт" in t.get("headers", [])
+                and "Өмнөх өдрийн хаалт" in t.get("headers", [])
+                and "Тоо ширхэг" in t.get("headers", [])
+                and "Үнийн дүн" in t.get("headers", [])
+            ]
+            # MSE report orders common-stock categories I, II, III first.
+            stock_rows = []
+            for t in detail[:3]:
+                stock_rows += parse_history_stock_table(t.get("rows", []), data)
+
+            by_i = {r[0]: r for r in stock_rows}
+            stock_rows = sorted(by_i.values(), key=lambda r: r[4], reverse=True)
+            if stock_rows:
+                result[d] = stock_rows
+                print(f"[backfill] {d}: stocks={len(stock_rows)}")
+            else:
+                print(f"[backfill] {d}: no stock trades")
+
+        browser.close()
+    return result
+
+def store_stock_day(data, d, stock_rows):
+    """Store one common-stock trading day and recompute alert/summary fields."""
+    alerts = build_alerts(data, stock_rows, d)
+    stock_turn = sum(r[4] for r in stock_rows)
+    qty = sum(r[3] for r in stock_rows)
+    up = sum(1 for r in stock_rows if (r[2] or 0) > 0)
+    down = sum(1 for r in stock_rows if (r[2] or 0) < 0)
+    crit = sum(1 for a in alerts if a[1] == "CRITICAL")
+
+    data.setdefault("days", {})[d] = stock_rows
+    data.setdefault("alerts", {})[d] = alerts
+
+    # Historical backfill is stock-level. Other-security and block-trade
+    # fields remain zero unless separately available.
+    old = data.setdefault("summary", {}).get(d)
+    block_count = old[7] if old and len(old) > 7 else 0
+    block_value = old[8] if old and len(old) > 8 else 0
+    other_value = old[9] if old and len(old) > 9 else 0
+    other_count = old[10] if old and len(old) > 10 else 0
+
+    data["summary"][d] = [
+        round(stock_turn,2), len(stock_rows), up, down, qty,
+        len(alerts), crit, block_count, block_value, other_value, other_count
+    ]
+    if d not in data["dates"]:
+        data["dates"].append(d)
+        data["dates"].sort()
+
+
 def parse_other_table(rows, category, ccy, data):
     out = []
     for c in rows:
@@ -243,82 +399,103 @@ def parse_block_table(rows, data, stock_close):
 
 def main():
     data = json.loads(DATA.read_text(encoding="utf-8"))
+    today = datetime.now(TZ).date().isoformat()
+
+    # Load today's page first. Historical backfill is handled separately below.
     tables = get_tables()
     nonempty = pick_nonempty(tables)
     print(f"[info] tables={len(tables)} nonempty={len(nonempty)}")
 
-    # The MSE page order is documented by the public page:
-    # 0-2 stock classes, 3 fund, 4 ABS, 5 government, 6 corp MNT,
-    # 7 corp USD, 8 block MNT, 9 block USD.
-    # We require at least the first stock tables to contain rendered rows.
     stock_rows = []
     for t in tables[:3]:
         stock_rows += parse_stock_table(t.get("rows",[]), data)
-
-    if not stock_rows:
-        raise RuntimeError(
-            "MSE stock rows were empty. The site may have no trading data today "
-            "or its table layout changed. data.json was not modified."
-        )
-
-    today = datetime.now(TZ).date().isoformat()
-    existing_latest = data.get("latest")
-    print(f"[info] writing trading date {today}; previous latest={existing_latest}")
-
-    # Deduplicate by symbol, keeping the last row seen.
     by_i = {r[0]:r for r in stock_rows}
     stock_rows = sorted(by_i.values(), key=lambda r:r[4], reverse=True)
 
-    other = []
-    specs = [
-        (3, "Хөрөнгө оруулалтын сан", "MNT"),
-        (4, "Хөрөнгөөр баталгаажсан ҮЦ", "MNT"),
-        (5, "Засгийн газрын ҮЦ", "MNT"),
-        (6, "Компанийн бонд", "MNT"),
-        (7, "Компанийн бонд", "USD"),
-    ]
-    for ti, cat, ccy in specs:
-        if ti < len(tables):
-            other += parse_other_table(tables[ti].get("rows",[]), cat, ccy, data)
+    # Backfill any missing weekdays between the most recent stored trading date
+    # and today. MSE's historical report will tell us whether a weekday actually
+    # had stock trades; weekends are skipped up front.
+    previous = sorted(d for d in data.get("dates", []) if d < today)
+    gap_dates = []
+    if previous:
+        cur = date.fromisoformat(previous[-1])
+        stop = date.fromisoformat(today)
+        from datetime import timedelta
+        cur += timedelta(days=1)
+        while cur < stop:
+            ds = cur.isoformat()
+            if cur.weekday() < 5 and ds not in data.get("days", {}):
+                gap_dates.append(ds)
+            cur += timedelta(days=1)
 
-    stock_close = {data["syms"][r[0]][0]:r[1] for r in stock_rows}
-    blocks = []
-    if 8 < len(tables):
-        blocks += parse_block_table(tables[8].get("rows",[]), data, stock_close)
-    if 9 < len(tables):
-        blocks += parse_block_table(tables[9].get("rows",[]), data, stock_close)
+    if gap_dates:
+        print(f"[backfill] missing weekdays={gap_dates}")
+        historical = fetch_historical_stock_days(gap_dates, data)
+        for d in gap_dates:
+            rows = historical.get(d)
+            if rows:
+                store_stock_day(data, d, rows)
 
-    alerts = build_alerts(data, stock_rows, today)
+    # Today's alerts must be computed after backfill so rolling history is
+    # continuous and signal calculations use the immediately preceding days.
+    if stock_rows:
+        other = []
+        specs = [
+            (3, "Хөрөнгө оруулалтын сан", "MNT"),
+            (4, "Хөрөнгөөр баталгаажсан ҮЦ", "MNT"),
+            (5, "Засгийн газрын ҮЦ", "MNT"),
+            (6, "Компанийн бонд", "MNT"),
+            (7, "Компанийн бонд", "USD"),
+        ]
+        for ti, cat, ccy in specs:
+            if ti < len(tables):
+                other += parse_other_table(tables[ti].get("rows",[]), cat, ccy, data)
 
-    stock_turn = sum(r[4] for r in stock_rows)
-    qty = sum(r[3] for r in stock_rows)
-    up = sum(1 for r in stock_rows if (r[2] or 0) > 0)
-    down = sum(1 for r in stock_rows if (r[2] or 0) < 0)
-    crit = sum(1 for a in alerts if a[1] == "CRITICAL")
-    block_val = sum(b[4] for b in blocks)
-    other_val = sum(o[6] for o in other if o[3] == "MNT")
+        stock_close = {data["syms"][r[0]][0]:r[1] for r in stock_rows}
+        blocks = []
+        if 8 < len(tables):
+            blocks += parse_block_table(tables[8].get("rows",[]), data, stock_close)
+        if 9 < len(tables):
+            blocks += parse_block_table(tables[9].get("rows",[]), data, stock_close)
 
-    data.setdefault("days", {})[today] = stock_rows
-    data.setdefault("alerts", {})[today] = alerts
-    if other:
-        data.setdefault("other", {})[today] = other
+        alerts = build_alerts(data, stock_rows, today)
+        stock_turn = sum(r[4] for r in stock_rows)
+        qty = sum(r[3] for r in stock_rows)
+        up = sum(1 for r in stock_rows if (r[2] or 0) > 0)
+        down = sum(1 for r in stock_rows if (r[2] or 0) < 0)
+        crit = sum(1 for a in alerts if a[1] == "CRITICAL")
+        block_val = sum(b[4] for b in blocks)
+        other_val = sum(o[6] for o in other if o[3] == "MNT")
+
+        data.setdefault("days", {})[today] = stock_rows
+        data.setdefault("alerts", {})[today] = alerts
+        if other:
+            data.setdefault("other", {})[today] = other
+        else:
+            data.setdefault("other", {}).pop(today, None)
+        if blocks:
+            data.setdefault("blocks", {})[today] = blocks
+        else:
+            data.setdefault("blocks", {}).pop(today, None)
+
+        data.setdefault("summary", {})[today] = [
+            round(stock_turn,2), len(stock_rows), up, down, qty,
+            len(alerts), crit, len(blocks), round(block_val,2),
+            round(other_val,2), len(other)
+        ]
+        if today not in data["dates"]:
+            data["dates"].append(today)
+            data["dates"].sort()
+        print(
+            f"[ok] {today}: stocks={len(stock_rows)} alerts={len(alerts)} "
+            f"other={len(other)} blocks={len(blocks)}"
+        )
     else:
-        data.setdefault("other", {}).pop(today, None)
-    if blocks:
-        data.setdefault("blocks", {})[today] = blocks
-    else:
-        data.setdefault("blocks", {}).pop(today, None)
+        print(f"[info] {today}: no current common-stock rows; historical backfill only")
 
-    data.setdefault("summary", {})[today] = [
-        round(stock_turn,2), len(stock_rows), up, down, qty,
-        len(alerts), crit, len(blocks), round(block_val,2),
-        round(other_val,2), len(other)
-    ]
-
-    if today not in data["dates"]:
-        data["dates"].append(today)
-        data["dates"].sort()
-    data["latest"] = max(data["dates"])
+    data["dates"] = sorted(set(data.get("dates", [])))
+    if data["dates"]:
+        data["latest"] = max(data["dates"])
     data["updated"] = datetime.now(TZ).isoformat(timespec="seconds")
 
     st = data.setdefault("stats", {})
@@ -327,8 +504,10 @@ def main():
     st["rows"] = sum(len(data.get("days",{}).get(d,[])) for d in data["dates"])
     st["alertsTotal"] = sum(len(v) for v in data.get("alerts",{}).values())
 
-    DATA.write_text(json.dumps(data, ensure_ascii=False, separators=(",",":")), encoding="utf-8")
-    print(f"[ok] {today}: stocks={len(stock_rows)} alerts={len(alerts)} other={len(other)} blocks={len(blocks)}")
+    DATA.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",",":")),
+        encoding="utf-8"
+    )
 
 if __name__ == "__main__":
     main()
