@@ -25,3 +25,5 @@ with sync_playwright() as p:
     for x in resps:
       print("[RESP]",json.dumps(x,ensure_ascii=False))
     b.close()
+
+# trigger
