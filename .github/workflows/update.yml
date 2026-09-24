@@ -2,8 +2,8 @@ name: Update MSE Dashboard
 
 on:
   schedule:
-    # 18:00 Ulaanbaatar = 10:00 UTC
-    - cron: "0 10 * * *"
+    # 17:40 Ulaanbaatar = 09:40 UTC
+    - cron: "40 9 * * *"
   workflow_dispatch:
 
 permissions:
