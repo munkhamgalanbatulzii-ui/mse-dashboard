@@ -908,9 +908,10 @@ def store_other_day(data, d, rows):
     data["otherMeta"] = {
         "date": d,
         "auto": True,
-        "source": "MSE trade-daily-report server actions",
-        "corporateBondMNT": "tradingStatusXK",
-        "corporateBondUSD": "tradingStatusUSD",
+        "source": "MSE daily market feeds",
+        "corporateBondSource": "www.mse.mn/todays-trade",
+        "corporateBondMNT": "Компанийн бонд /төгрөг/",
+        "corporateBondUSD": "Компанийн бонд /доллар/",
     }
 
 def fetch_block_days(target_dates, data, row_overrides=None):
