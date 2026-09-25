@@ -1,10 +1,6 @@
 name: Update MSE Dashboard
 
 on:
-  push:
-    paths:
-      - "scripts/update_mse.py"
-      - ".github/workflows/update.yml"
   schedule:
     # 17:40 Ulaanbaatar = 09:40 UTC
     - cron: "40 9 * * *"
