@@ -691,7 +691,18 @@ def _other_records_to_rows(records, category, ccy, data):
         retp = num(rec.get("changePercentage"), None)
         if close is None or qty <= 0:
             continue
-        name = previous_symbol_name(data, sym)
+
+        # Prefer the live MSE security/company name when the endpoint provides it.
+        # Fall back to the last known name so newly traded bonds do not disappear
+        # merely because one response omits its display name.
+        live_name = next((
+            txt(rec.get(k)) for k in (
+                "companyName", "securityName", "securitiesName",
+                "instrumentName", "name"
+            ) if txt(rec.get(k))
+        ), "")
+        name = live_name or previous_symbol_name(data, sym)
+
         rows.append([
             category, sym, name, ccy, float(close), int(qty),
             float(turn), round((retp or 0.0) / 100.0, 4)
@@ -699,7 +710,14 @@ def _other_records_to_rows(records, category, ccy, data):
     return rows
 
 def fetch_other_days(target_dates, data):
-    """Fetch funds, ABS, government securities and corporate bonds from exact MSE responses."""
+    """Fetch funds, ABS, government securities and corporate bonds from exact MSE responses.
+
+    Each endpoint is processed independently. In particular, company-bond feeds
+    (MNT tradingStatusXK and USD tradingStatusUSD) can update even if an unrelated
+    fund/ABS/government endpoint is temporarily missing. If an endpoint is missing
+    on a rerun, that same date/category/currency is preserved from data.json;
+    a successfully captured empty endpoint is treated as a true zero-trade day.
+    """
     if not target_dates:
         return {}
 
@@ -748,7 +766,6 @@ def fetch_other_days(target_dates, data):
         for d in target_dates:
             print(f"[other] loading {d}")
 
-            # Initial page load may already have captured the current date.
             if not all(k in captures.get(d, {}) for k in expected):
                 inp.evaluate(
                     """(e,v)=>{
@@ -772,20 +789,47 @@ def fetch_other_days(target_dates, data):
             missing = [k for k in expected if k not in got]
             if missing:
                 print(f"[other] {d}: missing responses={missing}")
-                continue
 
+            previous = data.get("other", {}).get(d, [])
             rows = []
+            captured_names = []
+
             for endpoint, (category, ccy) in OTHER_ENDPOINTS.items():
-                rows += _other_records_to_rows(
-                    got.get(endpoint, []), category, ccy, data
-                )
+                if endpoint in got:
+                    parsed = _other_records_to_rows(
+                        got.get(endpoint, []), category, ccy, data
+                    )
+                    rows += parsed
+                    captured_names.append(endpoint)
+                    if category == "Компанийн бонд":
+                        print(
+                            f"[bonds] {d}: endpoint={endpoint} ccy={ccy} "
+                            f"rows={len(parsed)} value="
+                            f"{sum(r[6] for r in parsed):.2f}"
+                        )
+                else:
+                    # Preserve only the missing endpoint's exact category/currency
+                    # from an earlier successful run of the same date.
+                    rows += [
+                        r for r in previous
+                        if len(r) >= 7 and r[0] == category and r[3] == ccy
+                    ]
+
+            # Deduplicate by category/symbol/currency, preferring current captures.
+            dedup = {}
+            for r in rows:
+                dedup[(r[0], r[1], r[3])] = r
+            rows = list(dedup.values())
+
             result[d] = rows
             cats = {}
             for r in rows:
-                cats[r[0] + ("/USD" if r[3] == "USD" else "")] = cats.get(
-                    r[0] + ("/USD" if r[3] == "USD" else ""), 0
-                ) + 1
-            print(f"[other] {d}: rows={len(rows)} categories={cats}")
+                key = r[0] + ("/USD" if r[3] == "USD" else "")
+                cats[key] = cats.get(key, 0) + 1
+            print(
+                f"[other] {d}: rows={len(rows)} categories={cats} "
+                f"captured={captured_names}"
+            )
 
         browser.close()
     return result
@@ -801,6 +845,14 @@ def store_other_day(data, d, rows):
         mnt_value = sum(r[6] for r in rows if r[3] == "MNT")
         data["summary"][d][9] = round(mnt_value, 2)
         data["summary"][d][10] = len(rows)
+
+    data["otherMeta"] = {
+        "date": d,
+        "auto": True,
+        "source": "MSE trade-daily-report server actions",
+        "corporateBondMNT": "tradingStatusXK",
+        "corporateBondUSD": "tradingStatusUSD",
+    }
 
 def fetch_block_days(target_dates, data, row_overrides=None):
     """Fetch MNT block trades from MSE daily-report for exact dates."""
