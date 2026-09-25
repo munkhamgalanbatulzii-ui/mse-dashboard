@@ -709,6 +709,65 @@ def _other_records_to_rows(records, category, ccy, data):
         ])
     return rows
 
+def fetch_legacy_today_bonds(data, trade_date):
+    """Fetch current-day corporate bonds from www.mse.mn/todays-trade.
+
+    The legacy/current MSE page exposes the actual MNT and USD secondary-market
+    bond tables even when new.mse.mn's tradingStatusXK/USD server actions return
+    empty arrays. This page is therefore authoritative for today's bond rows.
+    """
+    result = []
+    url = "https://www.mse.mn/todays-trade"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = _desktop_context(browser)
+        page = context.new_page()
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        if resp and resp.status >= 400:
+            browser.close()
+            raise RuntimeError(f"MSE legacy todays-trade HTTP {resp.status}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(4500)
+
+        specs = [
+            ("Компанийн бонд /төгрөг/", "MNT"),
+            ("Компанийн бонд /доллар/", "USD"),
+        ]
+
+        for label, ccy in specs:
+            raw = []
+            try:
+                heading = page.get_by_text(label, exact=True).first
+                table = heading.locator("xpath=following::table[1]")
+                raw = table.locator("tbody tr").evaluate_all(
+                    """trs => trs.map(tr =>
+                        Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
+                    ).filter(r => r.some(x => x && x.trim()))"""
+                )
+            except Exception as e:
+                print(f"[bonds-legacy] {trade_date} {ccy}: table warning {e}")
+                continue
+
+            parsed = parse_other_table(raw, "Компанийн бонд", ccy, data)
+            result += parsed
+            print(
+                f"[bonds-legacy] {trade_date} {ccy}: rows={len(parsed)} "
+                f"qty={sum(r[5] for r in parsed)} "
+                f"value={sum(r[6] for r in parsed):.2f}"
+            )
+
+        browser.close()
+
+    return result
+
+
 def fetch_other_days(target_dates, data):
     """Fetch funds, ABS, government securities and corporate bonds from exact MSE responses.
 
@@ -1391,6 +1450,20 @@ def main():
     # missed historical date. Daily scheduled runs always fetch today directly.
     other_targets = [today]
     other_rows_by_date = fetch_other_days(other_targets, data)
+
+    # www.mse.mn/todays-trade is authoritative for current-day corporate bonds.
+    # It currently carries live MNT/USD bond rows that the new server-action
+    # endpoints may return as empty. Replace only the corporate-bond slice.
+    try:
+        legacy_bonds = fetch_legacy_today_bonds(data, today)
+        base_other = [
+            r for r in other_rows_by_date.get(today, [])
+            if r[0] != "Компанийн бонд"
+        ]
+        other_rows_by_date[today] = base_other + legacy_bonds
+    except Exception as e:
+        print(f"[bonds-legacy] warning: {e}", file=sys.stderr)
+
     for od in other_targets:
         if od in other_rows_by_date:
             store_other_day(data, od, other_rows_by_date[od])
