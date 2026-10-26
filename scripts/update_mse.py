@@ -567,6 +567,56 @@ def _history_records_to_rows(records, data):
         ])
     return rows
 
+def fetch_legacy_today_stocks(data, trade_date):
+    """Fallback current-day common stocks from www.mse.mn/todays-trade."""
+    url = "https://www.mse.mn/todays-trade"
+    rows = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = _desktop_context(browser)
+        page = context.new_page()
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        if resp and resp.status >= 400:
+            browser.close()
+            raise RuntimeError(f"MSE legacy todays-trade HTTP {resp.status}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
+        try:
+            page.wait_for_function(
+                """() => Array.from(document.querySelectorAll('table tbody tr'))
+                    .some(r => r.querySelectorAll('td').length >= 11)""",
+                timeout=45000,
+            )
+        except PlaywrightTimeoutError:
+            page.wait_for_timeout(5000)
+
+        tables = page.eval_on_selector_all(
+            "table",
+            """els => els.map((t,ti) => ({
+                index: ti,
+                rows: Array.from(t.querySelectorAll('tbody tr')).map(tr =>
+                    Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
+                ).filter(r => r.some(x => x && x.trim()))
+            }))"""
+        )
+        for t in tables[:3]:
+            rows += parse_stock_table(t.get("rows", []), data)
+        browser.close()
+
+    by_i = {r[0]: r for r in rows}
+    rows = sorted(by_i.values(), key=lambda r: r[4], reverse=True)
+    print(
+        f"[stocks-legacy] {trade_date}: rows={len(rows)} "
+        f"turnover={sum(r[4] for r in rows):.2f}"
+    )
+    return rows
+
+
 def fetch_historical_stock_days(target_dates, data):
     """Fetch exact historical Cs1/Cs2/Cs3 JSON from MSE server-action responses."""
     if not target_dates:
@@ -1379,6 +1429,16 @@ def main():
         stock_rows = exact_today.get(today, [])
         if stock_rows:
             print(f"[info] recovered today's stocks from daily report: {len(stock_rows)}")
+
+    # Final fallback: legacy/current mse.mn todays-trade still exposes the
+    # live common-stock tables on days when new.mse.mn fails to hydrate.
+    if not stock_rows:
+        try:
+            stock_rows = fetch_legacy_today_stocks(data, today)
+            if stock_rows:
+                print(f"[info] recovered today's stocks from legacy todays-trade: {len(stock_rows)}")
+        except Exception as e:
+            print(f"[stocks-legacy] warning: {e}", file=sys.stderr)
 
     # Backfill any missing weekdays between the most recent stored trading date
     # and today. MSE's historical report will tell us whether a weekday actually
