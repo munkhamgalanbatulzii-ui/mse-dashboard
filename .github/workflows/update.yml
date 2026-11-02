@@ -48,3 +48,13 @@ jobs:
           git commit -m "chore: update MSE dashboard data"
           git pull --rebase origin main
           git push
+
+      - name: Send Outlook daily email
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          OUTLOOK_SENDER: ${{ secrets.OUTLOOK_SENDER }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python scripts/send_outlook_email.py
